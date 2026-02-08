@@ -1,0 +1,27 @@
+# Data files
+*.csv
+*.fasta
+*.pt
+*.pkl
+
+# Outputs
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# Environment
+.env
+*.yml
+!environment.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Shell scripts
+*.sh

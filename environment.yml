@@ -1,0 +1,23 @@
+name: gli-plapt
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.10
+  - pytorch=2.1
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
+  - numpy
+  - pandas
+  - scikit-learn
+  - scipy
+  - matplotlib
+  - seaborn
+  - tqdm
+  - pip
+  - pip:
+    - transformers>=4.35.0
+    - rdkit-pypi
+    - tensorboard
