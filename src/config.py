@@ -68,6 +68,12 @@ class PredictionHeadConfig:
     # MC Dropout inference
     mc_samples: int = 50
 
+    # Morgan fingerprint hybrid (Phase 2C)
+    use_morgan_fp: bool = True
+    morgan_fp_bits: int = 2048
+    morgan_fp_radius: int = 2
+    morgan_fp_hidden: int = 128
+
 
 @dataclass
 class PretrainConfig:
@@ -107,6 +113,16 @@ class GLIFinetuneConfig:
     patience: int = 7
     smiles_augment_per_positive: int = 10
     cosine_T0: int = 5
+
+    # Focal loss (Phase 2B)
+    use_focal_loss: bool = True
+    focal_gamma: float = 2.0
+    focal_alpha: float = 0.75
+
+    # Asymmetric augmentation (Phase 2D)
+    use_asymmetric_aug: bool = True
+    asym_aug_min: int = 5
+    asym_aug_max: int = 25
 
 
 @dataclass

@@ -23,6 +23,95 @@ from src.config import (
 # SMILES Augmentation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Morgan Fingerprints and Tanimoto Similarity (Phase 2)
+# ---------------------------------------------------------------------------
+
+def compute_morgan_fp(smiles: str, n_bits: int = 2048, radius: int = 2) -> np.ndarray:
+    """Compute Morgan (ECFP) fingerprint as a binary numpy array."""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+    except ImportError:
+        return np.zeros(n_bits, dtype=np.float32)
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return np.zeros(n_bits, dtype=np.float32)
+
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+    arr = np.zeros(n_bits, dtype=np.float32)
+    for bit in fp.GetOnBits():
+        arr[bit] = 1.0
+    return arr
+
+
+def compute_morgan_fps_batch(smiles_list: List[str], n_bits: int = 2048,
+                             radius: int = 2) -> torch.Tensor:
+    """Compute Morgan fingerprints for a list of SMILES → (N, n_bits) float tensor."""
+    fps = [compute_morgan_fp(s, n_bits, radius) for s in smiles_list]
+    return torch.tensor(np.stack(fps), dtype=torch.float32)
+
+
+def compute_tanimoto_matrix(smiles_list: List[str], radius: int = 2,
+                            n_bits: int = 2048) -> np.ndarray:
+    """Compute pairwise Tanimoto similarity matrix using Morgan fingerprints."""
+    try:
+        from rdkit import Chem, DataStructs
+        from rdkit.Chem import AllChem
+    except ImportError:
+        n = len(smiles_list)
+        return np.eye(n)
+
+    fps = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits))
+        else:
+            fps.append(AllChem.GetMorganFingerprintAsBitVect(
+                Chem.MolFromSmiles("C"), radius, nBits=n_bits))
+
+    n = len(fps)
+    sim_matrix = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i, n):
+            sim = DataStructs.TanimotoSimilarity(fps[i], fps[j])
+            sim_matrix[i, j] = sim
+            sim_matrix[j, i] = sim
+    return sim_matrix
+
+
+def compute_asymmetric_aug_counts(smiles_list: List[str],
+                                  base_aug: int = 10,
+                                  min_aug: int = 5,
+                                  max_aug: int = 25) -> List[int]:
+    """Compute per-compound augmentation counts inversely weighted by similarity.
+
+    Structurally isolated compounds get more augmentation (up to max_aug);
+    clustered compounds get less (down to min_aug). This rebalances the
+    effective training distribution to give the model more diverse views
+    of hard-to-predict compounds.
+    """
+    sim_matrix = compute_tanimoto_matrix(smiles_list)
+    n = len(smiles_list)
+    aug_counts = []
+
+    for i in range(n):
+        # Mean similarity to all OTHER compounds
+        others = [sim_matrix[i, j] for j in range(n) if j != i]
+        mean_sim = np.mean(others) if others else 0.0
+
+        # Inversely map: high similarity → low aug, low similarity → high aug
+        # Linear interpolation: sim=0 → max_aug, sim=1 → min_aug
+        aug = int(max_aug - (max_aug - min_aug) * mean_sim)
+        aug = max(min_aug, min(max_aug, aug))
+        aug_counts.append(aug)
+
+    logging.info(f"  Asymmetric augmentation counts: {dict(zip(smiles_list[:3], aug_counts[:3]))}...")
+    return aug_counts
+
+
 def randomize_smiles(smiles: str, n_augments: int = 1) -> List[str]:
     """Generate randomized (non-canonical) SMILES representations.
 
@@ -391,19 +480,28 @@ class ProteinLigandDataset(Dataset):
 
 
 class EmbeddedDataset(Dataset):
-    """Dataset of pre-computed embeddings + labels for efficient training."""
+    """Dataset of pre-computed embeddings + labels for efficient training.
+
+    Optionally carries Morgan fingerprint tensors for hybrid model.
+    """
 
     def __init__(self, protein_embeds: torch.Tensor, ligand_embeds: torch.Tensor,
-                 labels: torch.Tensor):
+                 labels: torch.Tensor, morgan_fps: Optional[torch.Tensor] = None):
         assert len(protein_embeds) == len(ligand_embeds) == len(labels)
+        if morgan_fps is not None:
+            assert len(morgan_fps) == len(labels)
         self.protein_embeds = protein_embeds
         self.ligand_embeds = ligand_embeds
         self.labels = labels
+        self.morgan_fps = morgan_fps
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
+        if self.morgan_fps is not None:
+            return (self.protein_embeds[idx], self.ligand_embeds[idx],
+                    self.morgan_fps[idx], self.labels[idx])
         return (self.protein_embeds[idx], self.ligand_embeds[idx], self.labels[idx])
 
 

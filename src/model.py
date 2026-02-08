@@ -44,6 +44,7 @@ class BranchingPredictionHead(nn.Module):
     def __init__(self, protein_dim: int, ligand_dim: int, cfg: PredictionHeadConfig):
         super().__init__()
         self.cfg = cfg
+        self.use_morgan_fp = cfg.use_morgan_fp
 
         # Protein branch
         self.protein_branch = nn.Sequential(
@@ -59,9 +60,19 @@ class BranchingPredictionHead(nn.Module):
             nn.Dropout(cfg.branch_dropout),
         )
 
+        # Optional Morgan fingerprint branch (Phase 2C)
+        morgan_out = 0
+        if self.use_morgan_fp:
+            self.morgan_branch = nn.Sequential(
+                nn.Linear(cfg.morgan_fp_bits, cfg.morgan_fp_hidden),
+                nn.ReLU(),
+                nn.Dropout(cfg.branch_dropout),
+            )
+            morgan_out = cfg.morgan_fp_hidden
+
         # Fusion layers: concat + hadamard product for interaction features
-        # Input = [prot_branch; lig_branch; prot_branch ⊙ lig_branch]
-        fusion_in = cfg.protein_branch_out + cfg.ligand_branch_out + cfg.protein_branch_out
+        # Input = [prot_branch; lig_branch; prot_branch ⊙ lig_branch; morgan_branch?]
+        fusion_in = cfg.protein_branch_out + cfg.ligand_branch_out + cfg.protein_branch_out + morgan_out
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, cfg.fusion_hidden_1),
             nn.ReLU(),
@@ -82,12 +93,14 @@ class BranchingPredictionHead(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, protein_emb: torch.Tensor, ligand_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, protein_emb: torch.Tensor, ligand_emb: torch.Tensor,
+                morgan_fp: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass returning raw logit (no sigmoid).
 
         Args:
             protein_emb: (batch, protein_dim)
             ligand_emb: (batch, ligand_dim)
+            morgan_fp: (batch, morgan_fp_bits) optional Morgan fingerprints
 
         Returns:
             logit: (batch, 1)
@@ -95,11 +108,25 @@ class BranchingPredictionHead(nn.Module):
         p = self.protein_branch(protein_emb)
         l = self.ligand_branch(ligand_emb)
         interaction = p * l  # Hadamard product for explicit interaction features
-        fused = torch.cat([p, l, interaction], dim=1)
+        parts = [p, l, interaction]
+
+        if self.use_morgan_fp:
+            if morgan_fp is not None:
+                m = self.morgan_branch(morgan_fp)
+            else:
+                # No Morgan FPs provided (Stage 1/2) — pass zeros to keep dims consistent
+                m = self.morgan_branch(
+                    torch.zeros(protein_emb.shape[0], self.cfg.morgan_fp_bits,
+                                device=protein_emb.device)
+                )
+            parts.append(m)
+
+        fused = torch.cat(parts, dim=1)
         return self.fusion(fused)
 
     def mc_predict(self, protein_emb: torch.Tensor, ligand_emb: torch.Tensor,
-                   n_samples: Optional[int] = None) -> Dict[str, torch.Tensor]:
+                   n_samples: Optional[int] = None,
+                   morgan_fp: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """MC Dropout inference for uncertainty estimation.
 
         Runs T stochastic forward passes with dropout enabled.
@@ -116,7 +143,7 @@ class BranchingPredictionHead(nn.Module):
         logits = []
         with torch.no_grad():
             for _ in range(T):
-                logit = self.forward(protein_emb, ligand_emb)
+                logit = self.forward(protein_emb, ligand_emb, morgan_fp=morgan_fp)
                 logits.append(logit.squeeze(-1))
 
         self.eval()

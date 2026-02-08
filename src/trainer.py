@@ -29,6 +29,57 @@ from src.utils import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Focal Loss (Phase 2B)
+# ---------------------------------------------------------------------------
+
+class FocalLoss(nn.Module):
+    """Focal Loss for binary classification (Lin et al., 2017).
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Down-weights well-classified (easy) examples and focuses training
+    on hard, misclassified examples. This is critical for our LOOCV
+    setting where the Wen2023 cluster is easy and the original 6
+    diverse compounds are hard.
+    """
+
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.75,
+                 pos_weight: float = 1.0):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.pos_weight = pos_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute focal loss from raw logits.
+
+        Args:
+            logits: (batch,) raw model output (before sigmoid)
+            targets: (batch,) binary labels (0 or 1)
+        """
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+
+        # Alpha weighting: alpha for positives, (1-alpha) for negatives
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+
+        # Apply pos_weight to positive examples (class imbalance correction)
+        weight = torch.ones_like(targets)
+        weight[targets == 1] = self.pos_weight
+
+        # Focal modulation: (1 - p_t)^gamma
+        focal_weight = (1 - p_t) ** self.gamma
+
+        # BCE component
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+
+        loss = alpha_t * focal_weight * weight * bce
+        return loss.mean()
+
+
 def compute_metrics(labels: np.ndarray, probs: np.ndarray,
                     threshold: float = 0.5) -> Dict[str, float]:
     """Compute all classification metrics."""
@@ -62,11 +113,16 @@ class Trainer:
     """Handles training loop for a single stage."""
 
     def __init__(self, model: BranchingPredictionHead, config: Config,
-                 device: torch.device, stage_name: str):
+                 device: torch.device, stage_name: str,
+                 use_focal_loss: bool = False,
+                 focal_gamma: float = 2.0, focal_alpha: float = 0.75):
         self.model = model.to(device)
         self.config = config
         self.device = device
         self.stage_name = stage_name
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
 
     def train_stage(self, train_loader: DataLoader, val_loader: DataLoader,
                     lr: float, weight_decay: float, epochs: int, patience: int,
@@ -88,9 +144,16 @@ class Trainer:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=cosine_T0, T_mult=1
         )
-        criterion = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pos_weight], device=self.device)
-        )
+        if self.use_focal_loss:
+            criterion = FocalLoss(
+                gamma=self.focal_gamma, alpha=self.focal_alpha,
+                pos_weight=pos_weight
+            )
+            logging.info(f"  Using Focal Loss (gamma={self.focal_gamma}, alpha={self.focal_alpha})")
+        else:
+            criterion = nn.BCEWithLogitsLoss(
+                pos_weight=torch.tensor([pos_weight], device=self.device)
+            )
 
         # Metrics logger
         csv_path = os.path.join(LOG_DIR, f"{self.stage_name}_epochs.csv")
@@ -183,6 +246,15 @@ class Trainer:
             "checkpoint_path": ckpt_path,
         }
 
+    def _unpack_batch(self, batch):
+        """Unpack batch handling both 3-element (no Morgan) and 4-element (with Morgan) formats."""
+        if len(batch) == 4:
+            prot_emb, lig_emb, morgan_fp, labels = batch
+            return prot_emb, lig_emb, morgan_fp, labels
+        else:
+            prot_emb, lig_emb, labels = batch
+            return prot_emb, lig_emb, None, labels
+
     def _train_epoch(self, loader: DataLoader, optimizer, criterion):
         """Single training epoch."""
         self.model.train()
@@ -190,13 +262,16 @@ class Trainer:
         all_labels = []
         all_probs = []
 
-        for prot_emb, lig_emb, labels in loader:
+        for batch in loader:
+            prot_emb, lig_emb, morgan_fp, labels = self._unpack_batch(batch)
             prot_emb = prot_emb.to(self.device)
             lig_emb = lig_emb.to(self.device)
             labels = labels.float().to(self.device)
+            if morgan_fp is not None:
+                morgan_fp = morgan_fp.to(self.device)
 
             optimizer.zero_grad()
-            logits = self.model(prot_emb, lig_emb).squeeze(-1)
+            logits = self.model(prot_emb, lig_emb, morgan_fp=morgan_fp).squeeze(-1)
             loss = criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
@@ -217,12 +292,15 @@ class Trainer:
         all_probs = []
 
         with torch.no_grad():
-            for prot_emb, lig_emb, labels in loader:
+            for batch in loader:
+                prot_emb, lig_emb, morgan_fp, labels = self._unpack_batch(batch)
                 prot_emb = prot_emb.to(self.device)
                 lig_emb = lig_emb.to(self.device)
                 labels = labels.float().to(self.device)
+                if morgan_fp is not None:
+                    morgan_fp = morgan_fp.to(self.device)
 
-                logits = self.model(prot_emb, lig_emb).squeeze(-1)
+                logits = self.model(prot_emb, lig_emb, morgan_fp=morgan_fp).squeeze(-1)
                 loss = criterion(logits, labels)
 
                 total_loss += loss.item() * len(labels)
@@ -336,12 +414,14 @@ def run_stage3_loocv_fold(model: BranchingPredictionHead,
                            test_lig_emb: torch.Tensor,
                            test_label: int,
                            config: Config, device: torch.device,
-                           fold_id: int) -> Dict:
+                           fold_id: int,
+                           test_morgan_fp: Optional[torch.Tensor] = None) -> Dict:
     """Stage 3: Single LOOCV fold.
 
     Trains on all data except one held-out positive.
     Evaluates on the held-out positive + returns MC Dropout uncertainty.
     Also computes optimal threshold from validation set (Youden's J).
+    Uses focal loss in Stage 3 when configured (Phase 2B).
     """
     cfg = config.gli_finetune
     # For single-fold, use 90/10 val split from training data
@@ -355,7 +435,10 @@ def run_stage3_loocv_fold(model: BranchingPredictionHead,
     train_loader = make_dataloader(train_ds, cfg.batch_size, shuffle=True)
     val_loader = make_dataloader(val_ds, cfg.batch_size, shuffle=False)
 
-    trainer = Trainer(model, config, device, f"stage3_fold{fold_id}")
+    trainer = Trainer(model, config, device, f"stage3_fold{fold_id}",
+                      use_focal_loss=cfg.use_focal_loss,
+                      focal_gamma=cfg.focal_gamma,
+                      focal_alpha=cfg.focal_alpha)
     result = trainer.train_stage(
         train_loader, val_loader,
         lr=cfg.lr, weight_decay=cfg.weight_decay,
@@ -378,8 +461,10 @@ def run_stage3_loocv_fold(model: BranchingPredictionHead,
     # MC Dropout prediction on held-out sample
     test_prot = test_prot_emb.unsqueeze(0).to(device)
     test_lig = test_lig_emb.unsqueeze(0).to(device)
+    test_mfp = test_morgan_fp.unsqueeze(0).to(device) if test_morgan_fp is not None else None
 
-    mc_result = model.mc_predict(test_prot, test_lig, n_samples=config.head.mc_samples)
+    mc_result = model.mc_predict(test_prot, test_lig, n_samples=config.head.mc_samples,
+                                  morgan_fp=test_mfp)
 
     result["held_out_prob"] = mc_result["mean_prob"].item()
     result["held_out_uncertainty"] = mc_result["std_prob"].item()

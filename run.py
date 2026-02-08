@@ -1,4 +1,4 @@
-"""GLI-PLAPT Main Pipeline — Multi-seed training + LOOCV + Phase 1 analyses.
+"""GLI-PLAPT Main Pipeline — Multi-seed training + LOOCV + Phase 1+2 analyses.
 
 Usage:
     python run.py --mode both          # Run baseline + modified + comparison
@@ -23,13 +23,16 @@ from src.config import Config, LOG_DIR, OUTPUT_DIR, MULTI_SEEDS
 from src.data import (
     load_bindingdb, load_zf_data, load_gli_data,
     EmbeddedDataset, randomize_smiles, EmbeddingCache,
+    compute_morgan_fps_batch, compute_asymmetric_aug_counts,
+    compute_morgan_fp,
 )
 from src.model import BranchingPredictionHead, EncoderWrapper
 from src.trainer import run_stage1_pretrain, run_stage2_domain_adapt
 from src.evaluate import run_loocv, compare_models
 from src.analysis import (
     consensus_analysis, esm2_truncation_analysis,
-    aggregate_multi_seed_results, save_phase1_results,
+    aggregate_multi_seed_results, save_all_results,
+    tanimoto_similarity_analysis,
 )
 from src.utils import (
     set_seed, setup_dirs, setup_logging, get_device,
@@ -66,6 +69,14 @@ class PrecomputedEmbeddings:
     s3_gli_neg_lig_embs: Optional[torch.Tensor]
     # GLI1 sequence (for truncation analysis)
     gli1_seq: str
+    # Morgan fingerprints (Phase 2C)
+    pos_morgan_fps: Optional[torch.Tensor] = None
+    neg_morgan_fps: Optional[torch.Tensor] = None
+    augmented_morgan_fps: Optional[Dict[int, torch.Tensor]] = None
+    supp_pos_morgan_fps: Optional[torch.Tensor] = None
+    gli_neg_morgan_fps: Optional[torch.Tensor] = None
+    # Compound SMILES for Tanimoto analysis (Phase 2A)
+    pos_smiles: Optional[List[str]] = None
 
 
 def precompute_embeddings(encoder: EncoderWrapper, smiles_list: List[str],
@@ -199,13 +210,27 @@ def precompute_all_embeddings(config: Config, device: torch.device) -> Precomput
             )
         logging.info(f"  ChEMBL GLI true negatives: {len(gli_neg_smiles)} compounds")
 
-    # Augmented positive ligand embeddings
+    # Augmented positive ligand embeddings (with asymmetric augmentation, Phase 2D)
     logging.info("  Generating SMILES augmentations for positives...")
     augmented_lig_embs = {}
-    n_aug = config.gli_finetune.smiles_augment_per_positive
+    augmented_morgan_fps_dict = {}
+    cfg_ft = config.gli_finetune
+    use_morgan = config.head.use_morgan_fp
+
+    if cfg_ft.use_asymmetric_aug:
+        aug_counts = compute_asymmetric_aug_counts(
+            pos_smiles, base_aug=cfg_ft.smiles_augment_per_positive,
+            min_aug=cfg_ft.asym_aug_min, max_aug=cfg_ft.asym_aug_max
+        )
+        logging.info(f"  Asymmetric augmentation: {dict(zip(pos_names, aug_counts))}")
+    else:
+        aug_counts = [cfg_ft.smiles_augment_per_positive] * len(pos_smiles)
+
     for i, smi in enumerate(pos_smiles):
+        n_aug = aug_counts[i]
         aug_smiles = randomize_smiles(smi, n_augments=n_aug)
         aug_embs = []
+        aug_mfps = []
         for asmi in aug_smiles:
             cached = cache.get(asmi, encoder.mol_model_name)
             if cached is not None:
@@ -214,8 +239,14 @@ def precompute_all_embeddings(config: Config, device: torch.device) -> Precomput
                 emb = encoder.encode_ligand(asmi)
                 cache.put(asmi, encoder.mol_model_name, emb)
                 aug_embs.append(emb)
+            if use_morgan:
+                aug_mfps.append(torch.tensor(compute_morgan_fp(
+                    asmi, config.head.morgan_fp_bits, config.head.morgan_fp_radius
+                )))
         augmented_lig_embs[i] = torch.stack(aug_embs)
-        logging.info(f"    {pos_names[i]}: {len(aug_embs)} augmented SMILES encoded")
+        if use_morgan:
+            augmented_morgan_fps_dict[i] = torch.stack(aug_mfps)
+        logging.info(f"    {pos_names[i]}: {n_aug} augmented SMILES encoded")
 
     # Negative embeddings
     neg_smiles = gli_neg_df["smiles"].tolist()
@@ -227,6 +258,32 @@ def precompute_all_embeddings(config: Config, device: torch.device) -> Precomput
 
     # Offload encoders to free GPU
     encoder.offload()
+
+    # --- Morgan fingerprints (Phase 2C) ---
+    pos_morgan_fps = None
+    neg_morgan_fps = None
+    supp_pos_mfps = None
+    gli_neg_mfps = None
+
+    if use_morgan:
+        logging.info("  Computing Morgan fingerprints (Phase 2C)...")
+        pos_morgan_fps = compute_morgan_fps_batch(
+            pos_smiles, config.head.morgan_fp_bits, config.head.morgan_fp_radius
+        )
+        neg_morgan_fps = compute_morgan_fps_batch(
+            neg_smiles, config.head.morgan_fp_bits, config.head.morgan_fp_radius
+        )
+        if len(chembl_gli_pos) > 0:
+            supp_pos_mfps = compute_morgan_fps_batch(
+                chembl_gli_pos["smiles"].tolist(),
+                config.head.morgan_fp_bits, config.head.morgan_fp_radius
+            )
+        if len(chembl_gli_neg) > 0:
+            gli_neg_mfps = compute_morgan_fps_batch(
+                chembl_gli_neg["smiles"].tolist(),
+                config.head.morgan_fp_bits, config.head.morgan_fp_radius
+            )
+        logging.info(f"    Morgan FPs: pos={pos_morgan_fps.shape}, neg={neg_morgan_fps.shape}")
 
     return PrecomputedEmbeddings(
         prot_dim=prot_dim, lig_dim=lig_dim,
@@ -241,6 +298,12 @@ def precompute_all_embeddings(config: Config, device: torch.device) -> Precomput
         s3_gli_neg_prot_embs=s3_gli_neg_prot_embs,
         s3_gli_neg_lig_embs=s3_gli_neg_lig_embs,
         gli1_seq=gli1_seq,
+        pos_morgan_fps=pos_morgan_fps,
+        neg_morgan_fps=neg_morgan_fps,
+        augmented_morgan_fps=augmented_morgan_fps_dict if use_morgan else None,
+        supp_pos_morgan_fps=supp_pos_mfps,
+        gli_neg_morgan_fps=gli_neg_mfps,
+        pos_smiles=pos_smiles,
     )
 
 
@@ -295,6 +358,11 @@ def run_training_pipeline(config: Config, device: torch.device,
             gli_neg_prot_embs=embs.s3_gli_neg_prot_embs,
             gli_neg_lig_embs=embs.s3_gli_neg_lig_embs,
             model_variant=f"{model_variant}_seed{seed}",
+            positive_morgan_fps=embs.pos_morgan_fps,
+            negative_morgan_fps=embs.neg_morgan_fps,
+            augmented_morgan_fps=embs.augmented_morgan_fps,
+            supp_pos_morgan_fps=embs.supp_pos_morgan_fps,
+            gli_neg_morgan_fps=embs.gli_neg_morgan_fps,
         )
     results["stage3"] = s3_result
 
@@ -327,10 +395,10 @@ def main():
 
     logging.info(f"Seeds: {seeds} ({'multi-seed' if multi_seed else 'single-seed'})")
 
-    phase1_results = {"seeds": seeds, "multi_seed": multi_seed}
+    all_results = {"seeds": seeds, "multi_seed": multi_seed}
 
     # =========================================================================
-    # Step 1: Precompute embeddings (once per encoder, deterministic)
+    # Step 0: Precompute embeddings (once per encoder, deterministic)
     # =========================================================================
     embs_mod = None
     embs_base = None
@@ -346,6 +414,17 @@ def main():
         log_config(config_base, "baseline_protbert")
         with Timer("Baseline embeddings (ProtBERT)"):
             embs_base = precompute_all_embeddings(config_base, device)
+
+    # =========================================================================
+    # Step 1: Tanimoto similarity analysis (Phase 2A — diagnostic)
+    # =========================================================================
+    # Run on first available embeddings (compound SMILES are the same for both encoders)
+    tanimoto_embs = embs_mod or embs_base
+    if tanimoto_embs is not None and tanimoto_embs.pos_smiles is not None:
+        tanimoto_result = tanimoto_similarity_analysis(
+            tanimoto_embs.pos_names, tanimoto_embs.pos_smiles
+        )
+        all_results["tanimoto_analysis"] = tanimoto_result
 
     # =========================================================================
     # Step 2: Train across all seeds
@@ -377,11 +456,11 @@ def main():
     # =========================================================================
     if multi_seed:
         if mod_seed_results:
-            phase1_results["esm2_multi_seed"] = aggregate_multi_seed_results(
+            all_results["esm2_multi_seed"] = aggregate_multi_seed_results(
                 mod_seed_results, "ESM-2"
             )
         if base_seed_results:
-            phase1_results["protbert_multi_seed"] = aggregate_multi_seed_results(
+            all_results["protbert_multi_seed"] = aggregate_multi_seed_results(
                 base_seed_results, "ProtBERT"
             )
 
@@ -394,7 +473,7 @@ def main():
             base_seed_results[primary_seed]["stage3"],
             mod_seed_results[primary_seed]["stage3"],
         )
-        phase1_results["comparison_primary_seed"] = {
+        all_results["comparison_primary_seed"] = {
             "seed": primary_seed,
             "mcnemar_p": comparison["mcnemar_p"],
             "ttest_p": comparison["ttest_p"],
@@ -428,7 +507,7 @@ def main():
             conservative_hrs = [c["hit_rate_conservative"] for c in consensus_per_seed.values()]
             optimistic_hrs = [c["hit_rate_optimistic"] for c in consensus_per_seed.values()]
 
-            phase1_results["consensus"] = {
+            all_results["consensus"] = {
                 "per_seed": {str(k): v for k, v in consensus_per_seed.items()},
                 "ensemble_hit_rate_mean": float(np.mean(ensemble_hrs)),
                 "ensemble_hit_rate_std": float(np.std(ensemble_hrs)),
@@ -456,7 +535,7 @@ def main():
             embs_mod.gli1_seq,
             esm2_max_length=Config().encoder.esm2_max_length,
         )
-        phase1_results["esm2_truncation"] = trunc
+        all_results["esm2_truncation"] = trunc
 
     # =========================================================================
     # Save all results
@@ -476,8 +555,8 @@ def main():
                 "mean_optimal_threshold": s3.get("mean_optimal_threshold", 0.5),
                 "per_compound": s3["per_compound"],
             }
-    if "comparison_primary_seed" in phase1_results:
-        summary["comparison"] = phase1_results["comparison_primary_seed"]
+    if "comparison_primary_seed" in all_results:
+        summary["comparison"] = all_results["comparison_primary_seed"]
 
     summary_path = os.path.join(OUTPUT_DIR, "results_summary.json")
     with open(summary_path, "w") as f:
@@ -485,7 +564,7 @@ def main():
     logging.info(f"\nResults summary saved: {summary_path}")
 
     # Phase 1 comprehensive results
-    save_phase1_results(phase1_results)
+    save_all_results(all_results)
 
     logging.info("\n=== PIPELINE COMPLETE ===")
 

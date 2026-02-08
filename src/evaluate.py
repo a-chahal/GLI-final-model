@@ -33,7 +33,12 @@ def run_loocv(model_template: BranchingPredictionHead,
               supp_pos_lig_embs: torch.Tensor = None,
               gli_neg_prot_embs: torch.Tensor = None,
               gli_neg_lig_embs: torch.Tensor = None,
-              model_variant: str = "") -> Dict:
+              model_variant: str = "",
+              positive_morgan_fps: torch.Tensor = None,
+              negative_morgan_fps: torch.Tensor = None,
+              augmented_morgan_fps: Dict[int, torch.Tensor] = None,
+              supp_pos_morgan_fps: torch.Tensor = None,
+              gli_neg_morgan_fps: torch.Tensor = None) -> Dict:
     """Run full Leave-One-Out Cross-Validation on GLI binders.
 
     For each fold:
@@ -93,6 +98,8 @@ def run_loocv(model_template: BranchingPredictionHead,
         train_prot_list = []
         train_lig_list = []
         train_labels = []
+        train_mfp_list = []  # Morgan fingerprints (Phase 2C)
+        has_morgan = positive_morgan_fps is not None
 
         for i in range(n_pos):
             if i == fold_idx:
@@ -101,14 +108,21 @@ def run_loocv(model_template: BranchingPredictionHead,
             train_prot_list.append(positive_prot_embs[i])
             train_lig_list.append(positive_lig_embs[i])
             train_labels.append(1)
+            if has_morgan:
+                train_mfp_list.append(positive_morgan_fps[i])
 
             # Augmented positives
             if i in augmented_positive_lig_embs:
                 aug_embs = augmented_positive_lig_embs[i]
+                aug_mfps = augmented_morgan_fps.get(i) if augmented_morgan_fps else None
                 for j in range(len(aug_embs)):
                     train_prot_list.append(positive_prot_embs[i])
                     train_lig_list.append(aug_embs[j])
                     train_labels.append(1)
+                    if has_morgan and aug_mfps is not None:
+                        train_mfp_list.append(aug_mfps[j])
+                    elif has_morgan:
+                        train_mfp_list.append(positive_morgan_fps[i])
 
         # ChEMBL GLI supplementary positives (always in training, never held out)
         if supp_pos_prot_embs is not None and supp_pos_lig_embs is not None:
@@ -116,12 +130,20 @@ def run_loocv(model_template: BranchingPredictionHead,
                 train_prot_list.append(supp_pos_prot_embs[i])
                 train_lig_list.append(supp_pos_lig_embs[i])
                 train_labels.append(1)
+                if has_morgan and supp_pos_morgan_fps is not None:
+                    train_mfp_list.append(supp_pos_morgan_fps[i])
+                elif has_morgan:
+                    train_mfp_list.append(torch.zeros(positive_morgan_fps.shape[1]))
 
         # All negatives (SMO + structural)
         for i in range(len(negative_lig_embs)):
             train_prot_list.append(negative_prot_embs[i])
             train_lig_list.append(negative_lig_embs[i])
             train_labels.append(0)
+            if has_morgan and negative_morgan_fps is not None:
+                train_mfp_list.append(negative_morgan_fps[i])
+            elif has_morgan:
+                train_mfp_list.append(torch.zeros(positive_morgan_fps.shape[1]))
 
         # ChEMBL GLI true negatives (tested against GLI, confirmed non-binders)
         if gli_neg_prot_embs is not None and gli_neg_lig_embs is not None:
@@ -129,17 +151,24 @@ def run_loocv(model_template: BranchingPredictionHead,
                 train_prot_list.append(gli_neg_prot_embs[i])
                 train_lig_list.append(gli_neg_lig_embs[i])
                 train_labels.append(0)
+                if has_morgan and gli_neg_morgan_fps is not None:
+                    train_mfp_list.append(gli_neg_morgan_fps[i])
+                elif has_morgan:
+                    train_mfp_list.append(torch.zeros(positive_morgan_fps.shape[1]))
 
+        train_morgan = torch.stack(train_mfp_list) if has_morgan else None
         train_dataset = EmbeddedDataset(
             protein_embeds=torch.stack(train_prot_list),
             ligand_embeds=torch.stack(train_lig_list),
             labels=torch.tensor(train_labels, dtype=torch.float32),
+            morgan_fps=train_morgan,
         )
 
         logging.info(f"  Fold {fold_idx + 1} training set: {len(train_dataset)} samples "
                      f"(pos={sum(train_labels)}, neg={len(train_labels) - sum(train_labels)})")
 
         # Run fold
+        test_mfp = positive_morgan_fps[fold_idx] if has_morgan else None
         result = run_stage3_loocv_fold(
             model=model,
             train_dataset=train_dataset,
@@ -149,13 +178,15 @@ def run_loocv(model_template: BranchingPredictionHead,
             config=config,
             device=device,
             fold_id=fold_idx + 1,
+            test_morgan_fp=test_mfp,
         )
 
         result["compound"] = positive_names[fold_idx]
 
         # --- Per-fold negative evaluation ---
         neg_eval = evaluate_on_negatives(
-            model, negative_prot_embs, negative_lig_embs, config, device
+            model, negative_prot_embs, negative_lig_embs, config, device,
+            morgan_fps=negative_morgan_fps,
         )
         opt_thresh = result.get("optimal_threshold", 0.5)
         neg_probs = neg_eval["neg_probs"]
@@ -252,16 +283,19 @@ def evaluate_on_negatives(model: BranchingPredictionHead,
                           negative_prot_embs: torch.Tensor,
                           negative_lig_embs: torch.Tensor,
                           config: Config,
-                          device: torch.device) -> Dict:
+                          device: torch.device,
+                          morgan_fps: torch.Tensor = None) -> Dict:
     """Evaluate trained model on all negatives using MC Dropout.
 
     Returns distribution of P(binder) and uncertainty for negatives.
     """
     model = model.to(device)
+    mfp = morgan_fps.to(device) if morgan_fps is not None else None
     mc_result = model.mc_predict(
         negative_prot_embs.to(device),
         negative_lig_embs.to(device),
         n_samples=config.head.mc_samples,
+        morgan_fp=mfp,
     )
 
     neg_probs = mc_result["mean_prob"].cpu().numpy()

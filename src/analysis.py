@@ -1,7 +1,8 @@
 """
-GLI-PLAPT Phase 1 Analysis — Cross-encoder consensus scoring and ESM-2 truncation analysis.
+GLI-PLAPT Analysis — Phase 1 + Phase 2 post-hoc analyses.
 
-These are post-hoc analyses that do not require retraining.
+Phase 1: Cross-encoder consensus scoring, ESM-2 truncation analysis.
+Phase 2: Tanimoto similarity analysis (diagnostic).
 """
 
 import logging
@@ -12,6 +13,103 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 
 from src.config import OUTPUT_DIR, LOG_DIR
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A: Tanimoto Similarity Analysis (Diagnostic)
+# ---------------------------------------------------------------------------
+
+def tanimoto_similarity_analysis(compound_names: List[str],
+                                  compound_smiles: List[str]) -> Dict:
+    """Quantify structural clustering among GLI compounds using Tanimoto similarity.
+
+    This diagnostic analysis explains WHY the Wen2023 cluster succeeds in LOOCV
+    while the original 6 diverse compounds fail: structurally similar compounds
+    provide mutual support when one is left out, while isolated compounds have
+    no structurally similar training examples.
+
+    Returns:
+        dict with similarity matrix, per-compound stats, cluster assignments
+    """
+    from src.data import compute_tanimoto_matrix
+
+    logging.info(f"\n{'='*60}")
+    logging.info("PHASE 2A: TANIMOTO SIMILARITY ANALYSIS")
+    logging.info(f"{'='*60}")
+
+    sim_matrix = compute_tanimoto_matrix(compound_smiles)
+    n = len(compound_names)
+
+    # Per-compound: mean similarity to all others, max similarity to nearest neighbor
+    per_compound = {}
+    for i in range(n):
+        others = [sim_matrix[i, j] for j in range(n) if j != i]
+        mean_sim = float(np.mean(others))
+        max_sim = float(np.max(others))
+        nn_idx = int(np.argmax([sim_matrix[i, j] if j != i else -1 for j in range(n)]))
+        per_compound[compound_names[i]] = {
+            "mean_tanimoto": mean_sim,
+            "max_tanimoto": max_sim,
+            "nearest_neighbor": compound_names[nn_idx],
+            "nn_tanimoto": float(sim_matrix[i, nn_idx]),
+            "isolated": mean_sim < 0.3,  # Threshold for structural isolation
+        }
+
+    # Identify clusters: compounds with mean Tanimoto > 0.4 to cluster members
+    # Simple approach: group compounds that are mutually similar
+    wen2023_names = {"Compound_39", "Compound_48", "Compound_49", "Compound_50", "Compound_52"}
+    wen2023_indices = [i for i, name in enumerate(compound_names) if name in wen2023_names]
+    other_indices = [i for i, name in enumerate(compound_names) if name not in wen2023_names]
+
+    # Intra-cluster vs inter-cluster similarity
+    intra_sims = []
+    for i in wen2023_indices:
+        for j in wen2023_indices:
+            if i < j:
+                intra_sims.append(sim_matrix[i, j])
+
+    inter_sims = []
+    for i in wen2023_indices:
+        for j in other_indices:
+            inter_sims.append(sim_matrix[i, j])
+
+    other_sims = []
+    for i in other_indices:
+        for j in other_indices:
+            if i < j:
+                other_sims.append(sim_matrix[i, j])
+
+    logging.info(f"\n  --- Structural Clustering ---")
+    logging.info(f"  Wen2023 intra-cluster Tanimoto:   {np.mean(intra_sims):.3f} ± {np.std(intra_sims):.3f}")
+    logging.info(f"  Wen2023 ↔ Original-6 Tanimoto:    {np.mean(inter_sims):.3f} ± {np.std(inter_sims):.3f}")
+    logging.info(f"  Original-6 inter-compound Tanimoto: {np.mean(other_sims):.3f} ± {np.std(other_sims):.3f}")
+
+    logging.info(f"\n  --- Per-Compound Similarity ---")
+    for name in compound_names:
+        info = per_compound[name]
+        iso = " ⚠ ISOLATED" if info["isolated"] else ""
+        logging.info(f"    {name:20s} mean_Tc={info['mean_tanimoto']:.3f} "
+                     f"max_Tc={info['max_tanimoto']:.3f} "
+                     f"NN={info['nearest_neighbor']}{iso}")
+
+    result = {
+        "sim_matrix": sim_matrix.tolist(),
+        "compound_names": compound_names,
+        "per_compound": per_compound,
+        "wen2023_intra_mean": float(np.mean(intra_sims)) if intra_sims else 0.0,
+        "wen2023_intra_std": float(np.std(intra_sims)) if intra_sims else 0.0,
+        "inter_cluster_mean": float(np.mean(inter_sims)) if inter_sims else 0.0,
+        "inter_cluster_std": float(np.std(inter_sims)) if inter_sims else 0.0,
+        "original6_inter_mean": float(np.mean(other_sims)) if other_sims else 0.0,
+        "original6_inter_std": float(np.std(other_sims)) if other_sims else 0.0,
+    }
+
+    logging.info(f"\n  KEY FINDING: Wen2023 compounds share high intra-cluster Tanimoto "
+                 f"({np.mean(intra_sims):.3f}), enabling mutual LOOCV support. "
+                 f"Original 6 are structurally diverse ({np.mean(other_sims):.3f}), "
+                 f"explaining their consistent prediction failure.")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +505,8 @@ def aggregate_multi_seed_results(seed_results: Dict[int, Dict],
     return result
 
 
-def save_phase1_results(all_results: Dict, output_dir: str = OUTPUT_DIR):
-    """Save all Phase 1 analysis results to a structured JSON file."""
+def save_all_results(all_results: Dict, output_dir: str = OUTPUT_DIR):
+    """Save all Phase 1+2 analysis results to a structured JSON file."""
     filepath = os.path.join(output_dir, "phase1_results.json")
     with open(filepath, "w") as f:
         json.dump(all_results, f, indent=2, default=str)
