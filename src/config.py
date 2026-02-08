@@ -14,6 +14,7 @@ LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 EMBED_CACHE_DIR = os.path.join(OUTPUT_DIR, "embedding_cache")
 
 SEED = 42
+MULTI_SEEDS = [42, 123, 456, 789, 1024]
 
 
 @dataclass

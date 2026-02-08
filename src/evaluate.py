@@ -41,6 +41,7 @@ def run_loocv(model_template: BranchingPredictionHead,
         2. Load Stage 2 checkpoint (fresh start per fold)
         3. Train on remaining positives (+ augmented + supplementary) + all negatives
         4. MC Dropout predict on held-out positive
+        5. Evaluate on negatives with both default and calibrated threshold
 
     Args:
         model_template: Uninitialized model (for architecture)
@@ -71,7 +72,9 @@ def run_loocv(model_template: BranchingPredictionHead,
     fold_logger = MetricsLogger(
         os.path.join(LOG_DIR, f"{prefix}stage3_loocv_folds.csv"),
         ["fold", "compound", "held_out_prob", "held_out_uncertainty",
-         "held_out_correct", "best_epoch", "best_val_loss",
+         "held_out_correct", "held_out_correct_calibrated",
+         "optimal_threshold", "fold_fpr_default", "fold_fpr_calibrated",
+         "best_epoch", "best_val_loss",
          "val_auroc", "val_auprc", "val_mcc"]
     )
 
@@ -149,6 +152,19 @@ def run_loocv(model_template: BranchingPredictionHead,
         )
 
         result["compound"] = positive_names[fold_idx]
+
+        # --- Per-fold negative evaluation ---
+        neg_eval = evaluate_on_negatives(
+            model, negative_prot_embs, negative_lig_embs, config, device
+        )
+        opt_thresh = result.get("optimal_threshold", 0.5)
+        neg_probs = neg_eval["neg_probs"]
+        result["fold_fpr_default"] = float((neg_probs > 0.5).mean())
+        result["fold_fpr_calibrated"] = float((neg_probs > opt_thresh).mean())
+        result["fold_neg_mean_prob"] = float(neg_probs.mean())
+        logging.info(f"  [Fold {fold_idx + 1}] Neg FPR @0.5: {result['fold_fpr_default']:.2%} | "
+                     f"@{opt_thresh:.2f}: {result['fold_fpr_calibrated']:.2%}")
+
         fold_results.append(result)
 
         # Log fold to CSV
@@ -159,6 +175,10 @@ def run_loocv(model_template: BranchingPredictionHead,
             "held_out_prob": f"{result['held_out_prob']:.4f}",
             "held_out_uncertainty": f"{result['held_out_uncertainty']:.4f}",
             "held_out_correct": result["held_out_correct"],
+            "held_out_correct_calibrated": result["held_out_correct_calibrated"],
+            "optimal_threshold": f"{opt_thresh:.3f}",
+            "fold_fpr_default": f"{result['fold_fpr_default']:.4f}",
+            "fold_fpr_calibrated": f"{result['fold_fpr_calibrated']:.4f}",
             "best_epoch": result["best_epoch"],
             "best_val_loss": f"{result['best_val_loss']:.4f}",
             "val_auroc": f"{bm.get('auroc', 'nan')}",
@@ -176,30 +196,54 @@ def aggregate_loocv_results(fold_results: List[Dict]) -> Dict:
     probs = [r["held_out_prob"] for r in fold_results]
     uncertainties = [r["held_out_uncertainty"] for r in fold_results]
     corrects = [r["held_out_correct"] for r in fold_results]
+    corrects_cal = [r.get("held_out_correct_calibrated", r["held_out_correct"]) for r in fold_results]
     compounds = [r["compound"] for r in fold_results]
+    opt_thresholds = [r.get("optimal_threshold", 0.5) for r in fold_results]
+    fold_fprs_default = [r.get("fold_fpr_default", np.nan) for r in fold_results]
+    fold_fprs_calibrated = [r.get("fold_fpr_calibrated", np.nan) for r in fold_results]
 
     hit_rate = sum(corrects) / len(corrects)
+    hit_rate_calibrated = sum(corrects_cal) / len(corrects_cal)
     mean_prob = np.mean(probs)
     std_prob = np.std(probs)
     mean_uncertainty = np.mean(uncertainties)
+    mean_opt_threshold = np.mean(opt_thresholds)
+    mean_fpr_default = np.nanmean(fold_fprs_default)
+    std_fpr_default = np.nanstd(fold_fprs_default)
+    mean_fpr_calibrated = np.nanmean(fold_fprs_calibrated)
+    std_fpr_calibrated = np.nanstd(fold_fprs_calibrated)
 
     logging.info(f"\n{'='*60}")
     logging.info(f"LOOCV AGGREGATE RESULTS")
     logging.info(f"{'='*60}")
-    logging.info(f"  Hit rate: {hit_rate:.2%} ({sum(corrects)}/{len(corrects)})")
+    logging.info(f"  Hit rate @0.5:        {hit_rate:.2%} ({sum(corrects)}/{len(corrects)})")
+    logging.info(f"  Hit rate @calibrated: {hit_rate_calibrated:.2%} ({sum(corrects_cal)}/{len(corrects_cal)})")
+    logging.info(f"  Mean optimal threshold: {mean_opt_threshold:.3f}")
     logging.info(f"  Mean P(binder): {mean_prob:.4f} ± {std_prob:.4f}")
     logging.info(f"  Mean uncertainty: {mean_uncertainty:.4f}")
+    logging.info(f"  Per-fold FPR @0.5: {mean_fpr_default:.2%} ± {std_fpr_default:.2%}")
+    logging.info(f"  Per-fold FPR @cal: {mean_fpr_calibrated:.2%} ± {std_fpr_calibrated:.2%}")
 
-    for i, (comp, prob, unc, correct) in enumerate(zip(compounds, probs, uncertainties, corrects)):
-        status = "HIT" if correct else "MISS"
-        logging.info(f"    {comp:25s} P={prob:.4f} σ={unc:.4f} [{status}]")
+    for i, (comp, prob, unc, correct, correct_cal, thresh) in enumerate(
+        zip(compounds, probs, uncertainties, corrects, corrects_cal, opt_thresholds)
+    ):
+        s05 = "HIT" if correct else "MISS"
+        scal = "HIT" if correct_cal else "MISS"
+        logging.info(f"    {comp:25s} P={prob:.4f} σ={unc:.4f} "
+                     f"[@0.5:{s05}] [@{thresh:.2f}:{scal}]")
 
     return {
         "fold_results": fold_results,
         "hit_rate": hit_rate,
+        "hit_rate_calibrated": hit_rate_calibrated,
         "mean_prob": mean_prob,
         "std_prob": std_prob,
         "mean_uncertainty": mean_uncertainty,
+        "mean_optimal_threshold": mean_opt_threshold,
+        "mean_fpr_default": mean_fpr_default,
+        "std_fpr_default": std_fpr_default,
+        "mean_fpr_calibrated": mean_fpr_calibrated,
+        "std_fpr_calibrated": std_fpr_calibrated,
         "per_compound": dict(zip(compounds, probs)),
     }
 

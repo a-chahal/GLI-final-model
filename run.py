@@ -1,35 +1,71 @@
-"""
-GLI-PLAPT Main Pipeline — Runs the complete 3-stage training + LOOCV evaluation.
+"""GLI-PLAPT Main Pipeline — Multi-seed training + LOOCV + Phase 1 analyses.
 
 Usage:
     python run.py --mode both          # Run baseline + modified + comparison
     python run.py --mode modified      # Run only modified (ESM-2) model
     python run.py --mode baseline      # Run only baseline (ProtBERT) model
+    python run.py --seeds 42           # Single seed (default)
+    python run.py --seeds all          # All 5 seeds for statistical robustness
+    python run.py --seeds 42,123,456   # Custom seed list
 """
 
 import argparse
 import logging
 import os
 import json
-import copy
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-from src.config import Config, CHECKPOINT_DIR, LOG_DIR, OUTPUT_DIR, NEGATIVE_SOURCES_KEEP
+from src.config import Config, LOG_DIR, OUTPUT_DIR, MULTI_SEEDS
 from src.data import (
     load_bindingdb, load_zf_data, load_gli_data,
-    EmbeddedDataset, ProteinLigandDataset, randomize_smiles,
-    EmbeddingCache,
+    EmbeddedDataset, randomize_smiles, EmbeddingCache,
 )
 from src.model import BranchingPredictionHead, EncoderWrapper
 from src.trainer import run_stage1_pretrain, run_stage2_domain_adapt
-from src.evaluate import run_loocv, evaluate_on_negatives, compare_models
+from src.evaluate import run_loocv, compare_models
+from src.analysis import (
+    consensus_analysis, esm2_truncation_analysis,
+    aggregate_multi_seed_results, save_phase1_results,
+)
 from src.utils import (
     set_seed, setup_dirs, setup_logging, get_device,
     log_config, log_environment, Timer,
 )
+
+
+@dataclass
+class PrecomputedEmbeddings:
+    """All precomputed embeddings for one encoder variant (deterministic)."""
+    prot_dim: int
+    lig_dim: int
+    # Stage 1
+    s1_prot_embs: torch.Tensor
+    s1_lig_embs: torch.Tensor
+    s1_labels: torch.Tensor
+    # Stage 2
+    s2_prot_embs: torch.Tensor
+    s2_lig_embs: torch.Tensor
+    s2_labels: torch.Tensor
+    # Stage 3 positives
+    s3_pos_prot_embs: torch.Tensor
+    s3_pos_lig_embs: torch.Tensor
+    pos_names: List[str]
+    # Stage 3 negatives
+    s3_neg_prot_embs: torch.Tensor
+    s3_neg_lig_embs: torch.Tensor
+    # Stage 3 augmented
+    augmented_lig_embs: Dict[int, torch.Tensor]
+    # Stage 3 supplementary
+    s3_supp_pos_prot_embs: Optional[torch.Tensor]
+    s3_supp_pos_lig_embs: Optional[torch.Tensor]
+    s3_gli_neg_prot_embs: Optional[torch.Tensor]
+    s3_gli_neg_lig_embs: Optional[torch.Tensor]
+    # GLI1 sequence (for truncation analysis)
+    gli1_seq: str
 
 
 def precompute_embeddings(encoder: EncoderWrapper, smiles_list: List[str],
@@ -82,26 +118,26 @@ def precompute_embeddings(encoder: EncoderWrapper, smiles_list: List[str],
     return prot_embs, lig_embs
 
 
-def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> Dict:
-    """Run the complete 3-stage pipeline for one model variant."""
+def precompute_all_embeddings(config: Config, device: torch.device) -> PrecomputedEmbeddings:
+    """Precompute ALL embeddings for one encoder variant.
+
+    Embeddings are deterministic (frozen encoders) and cached to disk,
+    so this only needs to run once per encoder variant regardless of seed count.
+    """
+    variant = "ESM-2" if config.use_esm2 else "ProtBERT"
     logging.info(f"\n{'#'*60}")
-    logging.info(f"# PIPELINE: {experiment_name}")
-    logging.info(f"# Protein encoder: {'ESM-2 650M' if config.use_esm2 else 'ProtBERT'}")
+    logging.info(f"# PRECOMPUTING EMBEDDINGS: {variant}")
     logging.info(f"{'#'*60}")
 
     cache = EmbeddingCache()
-    results = {}
 
-    # -------------------------------------------------------------------------
-    # Load encoder and pre-compute embeddings
-    # -------------------------------------------------------------------------
     with Timer("Encoder loading"):
         encoder = EncoderWrapper(config, device)
 
     prot_dim = encoder.prot_dim
     lig_dim = encoder.mol_dim
 
-    # --- Stage 1: BindingDB embeddings ---
+    # --- Stage 1: BindingDB ---
     logging.info("\n=== Loading Stage 1 data (BindingDB) ===")
     bindingdb_df = load_bindingdb(config)
     with Timer("Stage 1 embedding"):
@@ -112,9 +148,8 @@ def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> 
             cache, "stage1_bindingdb"
         )
     s1_labels = torch.tensor(bindingdb_df["label"].values, dtype=torch.float32)
-    s1_dataset = EmbeddedDataset(s1_prot_embs, s1_lig_embs, s1_labels)
 
-    # --- Stage 2: ZF embeddings ---
+    # --- Stage 2: ZF ---
     logging.info("\n=== Loading Stage 2 data (ZF) ===")
     zf_df = load_zf_data(config)
     with Timer("Stage 2 embedding"):
@@ -125,15 +160,12 @@ def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> 
             cache, "stage2_zf"
         )
     s2_labels = torch.tensor(zf_df["label"].values, dtype=torch.float32)
-    s2_dataset = EmbeddedDataset(s2_prot_embs, s2_lig_embs, s2_labels)
 
-    # --- Stage 3: GLI embeddings ---
+    # --- Stage 3: GLI ---
     logging.info("\n=== Loading Stage 3 data (GLI) ===")
     gli_pos_df, gli_neg_df, chembl_gli_pos, chembl_gli_neg, gli1_seq = load_gli_data(config)
 
-    # Positive embeddings (canonical)
     pos_smiles = gli_pos_df["smiles"].tolist()
-    # gli_inhibitors.csv uses "compound_name" as first column
     name_col = next((c for c in gli_pos_df.columns if "name" in c.lower() or "id" in c.lower()), gli_pos_df.columns[0])
     pos_names = gli_pos_df[name_col].tolist()
     pos_prots = [gli1_seq] * len(pos_smiles)
@@ -143,7 +175,7 @@ def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> 
             encoder, pos_smiles, pos_prots, cache, "stage3_positives"
         )
 
-    # ChEMBL GLI supplementary positives (always in training, never held out)
+    # Supplementary positives
     s3_supp_pos_prot_embs = None
     s3_supp_pos_lig_embs = None
     if len(chembl_gli_pos) > 0:
@@ -155,7 +187,7 @@ def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> 
             )
         logging.info(f"  ChEMBL GLI supplementary positives: {len(supp_pos_smiles)} compounds")
 
-    # ChEMBL GLI true negatives (tested against GLI, confirmed non-binders)
+    # True GLI negatives
     s3_gli_neg_prot_embs = None
     s3_gli_neg_lig_embs = None
     if len(chembl_gli_neg) > 0:
@@ -185,10 +217,9 @@ def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> 
         augmented_lig_embs[i] = torch.stack(aug_embs)
         logging.info(f"    {pos_names[i]}: {len(aug_embs)} augmented SMILES encoded")
 
-    # Negative embeddings (SMO + structural)
+    # Negative embeddings
     neg_smiles = gli_neg_df["smiles"].tolist()
     neg_prots = [gli1_seq] * len(neg_smiles)
-
     with Timer("Stage 3 negative embedding"):
         s3_neg_prot_embs, s3_neg_lig_embs = precompute_embeddings(
             encoder, neg_smiles, neg_prots, cache, "stage3_negatives"
@@ -197,10 +228,42 @@ def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> 
     # Offload encoders to free GPU
     encoder.offload()
 
-    # -------------------------------------------------------------------------
+    return PrecomputedEmbeddings(
+        prot_dim=prot_dim, lig_dim=lig_dim,
+        s1_prot_embs=s1_prot_embs, s1_lig_embs=s1_lig_embs, s1_labels=s1_labels,
+        s2_prot_embs=s2_prot_embs, s2_lig_embs=s2_lig_embs, s2_labels=s2_labels,
+        s3_pos_prot_embs=s3_pos_prot_embs, s3_pos_lig_embs=s3_pos_lig_embs,
+        pos_names=pos_names,
+        s3_neg_prot_embs=s3_neg_prot_embs, s3_neg_lig_embs=s3_neg_lig_embs,
+        augmented_lig_embs=augmented_lig_embs,
+        s3_supp_pos_prot_embs=s3_supp_pos_prot_embs,
+        s3_supp_pos_lig_embs=s3_supp_pos_lig_embs,
+        s3_gli_neg_prot_embs=s3_gli_neg_prot_embs,
+        s3_gli_neg_lig_embs=s3_gli_neg_lig_embs,
+        gli1_seq=gli1_seq,
+    )
+
+
+def run_training_pipeline(config: Config, device: torch.device,
+                          embs: PrecomputedEmbeddings, seed: int,
+                          experiment_name: str) -> Dict:
+    """Run the 3-stage training pipeline for one seed using precomputed embeddings."""
+    logging.info(f"\n{'#'*60}")
+    logging.info(f"# TRAINING: {experiment_name} (seed={seed})")
+    logging.info(f"{'#'*60}")
+
+    # Set seed for this run
+    config.seed = seed
+    set_seed(seed)
+
+    results = {}
+
+    # Build datasets from precomputed embeddings
+    s1_dataset = EmbeddedDataset(embs.s1_prot_embs, embs.s1_lig_embs, embs.s1_labels)
+    s2_dataset = EmbeddedDataset(embs.s2_prot_embs, embs.s2_lig_embs, embs.s2_labels)
+
     # Build and train prediction head
-    # -------------------------------------------------------------------------
-    model = BranchingPredictionHead(prot_dim, lig_dim, config.head)
+    model = BranchingPredictionHead(embs.prot_dim, embs.lig_dim, config.head)
     logging.info(f"Prediction head: {model.count_parameters():,} trainable parameters")
 
     # --- Stage 1: Pretrain ---
@@ -214,92 +277,216 @@ def run_pipeline(config: Config, device: torch.device, experiment_name: str) -> 
     results["stage2"] = s2_result
 
     # --- Stage 3: LOOCV ---
+    model_variant = "esm2" if config.use_esm2 else "protbert"
     with Timer("Stage 3 LOOCV"):
         s3_result = run_loocv(
             model_template=model,
             stage2_checkpoint=s2_result["checkpoint_path"],
-            positive_prot_embs=s3_pos_prot_embs,
-            positive_lig_embs=s3_pos_lig_embs,
-            positive_names=pos_names,
-            negative_prot_embs=s3_neg_prot_embs,
-            negative_lig_embs=s3_neg_lig_embs,
-            augmented_positive_lig_embs=augmented_lig_embs,
+            positive_prot_embs=embs.s3_pos_prot_embs,
+            positive_lig_embs=embs.s3_pos_lig_embs,
+            positive_names=embs.pos_names,
+            negative_prot_embs=embs.s3_neg_prot_embs,
+            negative_lig_embs=embs.s3_neg_lig_embs,
+            augmented_positive_lig_embs=embs.augmented_lig_embs,
             config=config,
             device=device,
-            supp_pos_prot_embs=s3_supp_pos_prot_embs,
-            supp_pos_lig_embs=s3_supp_pos_lig_embs,
-            gli_neg_prot_embs=s3_gli_neg_prot_embs,
-            gli_neg_lig_embs=s3_gli_neg_lig_embs,
-            model_variant="esm2" if config.use_esm2 else "protbert",
+            supp_pos_prot_embs=embs.s3_supp_pos_prot_embs,
+            supp_pos_lig_embs=embs.s3_supp_pos_lig_embs,
+            gli_neg_prot_embs=embs.s3_gli_neg_prot_embs,
+            gli_neg_lig_embs=embs.s3_gli_neg_lig_embs,
+            model_variant=f"{model_variant}_seed{seed}",
         )
     results["stage3"] = s3_result
 
-    # Evaluate final model on negatives
-    neg_eval = evaluate_on_negatives(
-        model, s3_neg_prot_embs, s3_neg_lig_embs, config, device
-    )
-    results["negative_eval"] = neg_eval
-
     return results
+
+
+def parse_seeds(seeds_arg: str) -> List[int]:
+    """Parse --seeds argument into list of integers."""
+    if seeds_arg == "all":
+        return MULTI_SEEDS
+    return [int(s.strip()) for s in seeds_arg.split(",")]
 
 
 def main():
     parser = argparse.ArgumentParser(description="GLI-PLAPT Pipeline")
     parser.add_argument("--mode", choices=["both", "modified", "baseline"],
                         default="both", help="Which model(s) to run")
+    parser.add_argument("--seeds", type=str, default="42",
+                        help="Seeds: 'all' for 5 seeds, or comma-separated (e.g. '42,123,456')")
     args = parser.parse_args()
 
+    seeds = parse_seeds(args.seeds)
+    multi_seed = len(seeds) > 1
+
     setup_dirs()
-    set_seed()
+    set_seed(seeds[0])
     logger = setup_logging("gli_plapt")
     device = get_device()
     log_environment()
 
-    all_results = {}
+    logging.info(f"Seeds: {seeds} ({'multi-seed' if multi_seed else 'single-seed'})")
+
+    phase1_results = {"seeds": seeds, "multi_seed": multi_seed}
+
+    # =========================================================================
+    # Step 1: Precompute embeddings (once per encoder, deterministic)
+    # =========================================================================
+    embs_mod = None
+    embs_base = None
 
     if args.mode in ("both", "modified"):
         config_mod = Config(use_esm2=True)
         log_config(config_mod, "modified_esm2")
-        with Timer("Modified pipeline (ESM-2)"):
-            all_results["modified"] = run_pipeline(config_mod, device, "GLI-PLAPT (ESM-2)")
+        with Timer("Modified embeddings (ESM-2)"):
+            embs_mod = precompute_all_embeddings(config_mod, device)
 
     if args.mode in ("both", "baseline"):
         config_base = Config(use_esm2=False)
         log_config(config_base, "baseline_protbert")
-        with Timer("Baseline pipeline (ProtBERT)"):
-            all_results["baseline"] = run_pipeline(config_base, device, "Baseline PLAPT (ProtBERT)")
+        with Timer("Baseline embeddings (ProtBERT)"):
+            embs_base = precompute_all_embeddings(config_base, device)
 
-    if args.mode == "both" and "modified" in all_results and "baseline" in all_results:
+    # =========================================================================
+    # Step 2: Train across all seeds
+    # =========================================================================
+    mod_seed_results = {}  # {seed: pipeline_result}
+    base_seed_results = {}
+
+    for seed in seeds:
+        logging.info(f"\n{'*'*60}")
+        logging.info(f"* SEED: {seed}")
+        logging.info(f"{'*'*60}")
+
+        if embs_mod is not None:
+            config_mod = Config(use_esm2=True, seed=seed)
+            with Timer(f"Modified pipeline seed={seed}"):
+                mod_seed_results[seed] = run_training_pipeline(
+                    config_mod, device, embs_mod, seed, f"GLI-PLAPT (ESM-2) seed={seed}"
+                )
+
+        if embs_base is not None:
+            config_base = Config(use_esm2=False, seed=seed)
+            with Timer(f"Baseline pipeline seed={seed}"):
+                base_seed_results[seed] = run_training_pipeline(
+                    config_base, device, embs_base, seed, f"Baseline (ProtBERT) seed={seed}"
+                )
+
+    # =========================================================================
+    # Step 3: Multi-seed aggregation (Phase 1A)
+    # =========================================================================
+    if multi_seed:
+        if mod_seed_results:
+            phase1_results["esm2_multi_seed"] = aggregate_multi_seed_results(
+                mod_seed_results, "ESM-2"
+            )
+        if base_seed_results:
+            phase1_results["protbert_multi_seed"] = aggregate_multi_seed_results(
+                base_seed_results, "ProtBERT"
+            )
+
+    # =========================================================================
+    # Step 4: Per-seed statistical comparison (use first seed for backward compat)
+    # =========================================================================
+    primary_seed = seeds[0]
+    if args.mode == "both" and primary_seed in mod_seed_results and primary_seed in base_seed_results:
         comparison = compare_models(
-            all_results["baseline"]["stage3"],
-            all_results["modified"]["stage3"],
+            base_seed_results[primary_seed]["stage3"],
+            mod_seed_results[primary_seed]["stage3"],
         )
-        all_results["comparison"] = comparison
+        phase1_results["comparison_primary_seed"] = {
+            "seed": primary_seed,
+            "mcnemar_p": comparison["mcnemar_p"],
+            "ttest_p": comparison["ttest_p"],
+            "bootstrap_ci": list(comparison["bootstrap_ci"]),
+            "baseline_hit_rate": comparison["baseline_hit_rate"],
+            "modified_hit_rate": comparison["modified_hit_rate"],
+        }
 
-    # Save final results summary
-    summary_path = os.path.join(OUTPUT_DIR, "results_summary.json")
-    summary = {}
-    for key in all_results:
-        if key == "comparison":
-            summary["comparison"] = {
-                "mcnemar_p": all_results["comparison"]["mcnemar_p"],
-                "ttest_p": all_results["comparison"]["ttest_p"],
-                "bootstrap_ci": list(all_results["comparison"]["bootstrap_ci"]),
-                "baseline_hit_rate": all_results["comparison"]["baseline_hit_rate"],
-                "modified_hit_rate": all_results["comparison"]["modified_hit_rate"],
+    # =========================================================================
+    # Step 5: Cross-encoder consensus analysis (Phase 1C)
+    # =========================================================================
+    if args.mode == "both" and mod_seed_results and base_seed_results:
+        logging.info("\n" + "="*60)
+        logging.info("PHASE 1C: CROSS-ENCODER CONSENSUS ANALYSIS")
+        logging.info("="*60)
+
+        # Run consensus on each seed
+        consensus_per_seed = {}
+        for seed in seeds:
+            if seed in mod_seed_results and seed in base_seed_results:
+                cons = consensus_analysis(
+                    base_seed_results[seed]["stage3"],
+                    mod_seed_results[seed]["stage3"],
+                    threshold=0.5,
+                )
+                consensus_per_seed[seed] = cons
+
+        # Aggregate consensus across seeds
+        if consensus_per_seed:
+            ensemble_hrs = [c["hit_rate_ensemble"] for c in consensus_per_seed.values()]
+            conservative_hrs = [c["hit_rate_conservative"] for c in consensus_per_seed.values()]
+            optimistic_hrs = [c["hit_rate_optimistic"] for c in consensus_per_seed.values()]
+
+            phase1_results["consensus"] = {
+                "per_seed": {str(k): v for k, v in consensus_per_seed.items()},
+                "ensemble_hit_rate_mean": float(np.mean(ensemble_hrs)),
+                "ensemble_hit_rate_std": float(np.std(ensemble_hrs)),
+                "conservative_hit_rate_mean": float(np.mean(conservative_hrs)),
+                "conservative_hit_rate_std": float(np.std(conservative_hrs)),
+                "optimistic_hit_rate_mean": float(np.mean(optimistic_hrs)),
+                "optimistic_hit_rate_std": float(np.std(optimistic_hrs)),
             }
-        elif "stage3" in all_results[key]:
-            s3 = all_results[key]["stage3"]
-            summary[key] = {
+
+            if multi_seed:
+                logging.info(f"\n  --- Consensus Aggregated ({len(seeds)} seeds) ---")
+                logging.info(f"  Ensemble hit rate:      {np.mean(ensemble_hrs):.2%} ± {np.std(ensemble_hrs):.2%}")
+                logging.info(f"  Conservative hit rate:  {np.mean(conservative_hrs):.2%} ± {np.std(conservative_hrs):.2%}")
+                logging.info(f"  Optimistic hit rate:    {np.mean(optimistic_hrs):.2%} ± {np.std(optimistic_hrs):.2%}")
+
+    # =========================================================================
+    # Step 6: ESM-2 truncation analysis (Phase 1D)
+    # =========================================================================
+    if embs_mod is not None:
+        logging.info("\n" + "="*60)
+        logging.info("PHASE 1D: ESM-2 TRUNCATION ANALYSIS")
+        logging.info("="*60)
+
+        trunc = esm2_truncation_analysis(
+            embs_mod.gli1_seq,
+            esm2_max_length=Config().encoder.esm2_max_length,
+        )
+        phase1_results["esm2_truncation"] = trunc
+
+    # =========================================================================
+    # Save all results
+    # =========================================================================
+    # Legacy results_summary.json (backward compatible)
+    summary = {}
+    for variant, seed_results in [("modified", mod_seed_results), ("baseline", base_seed_results)]:
+        if primary_seed in seed_results:
+            s3 = seed_results[primary_seed]["stage3"]
+            summary[variant] = {
                 "hit_rate": s3["hit_rate"],
+                "hit_rate_calibrated": s3.get("hit_rate_calibrated", s3["hit_rate"]),
                 "mean_prob": s3["mean_prob"],
                 "mean_uncertainty": s3["mean_uncertainty"],
+                "mean_fpr_default": s3.get("mean_fpr_default", None),
+                "mean_fpr_calibrated": s3.get("mean_fpr_calibrated", None),
+                "mean_optimal_threshold": s3.get("mean_optimal_threshold", 0.5),
                 "per_compound": s3["per_compound"],
             }
+    if "comparison_primary_seed" in phase1_results:
+        summary["comparison"] = phase1_results["comparison_primary_seed"]
 
+    summary_path = os.path.join(OUTPUT_DIR, "results_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
     logging.info(f"\nResults summary saved: {summary_path}")
+
+    # Phase 1 comprehensive results
+    save_phase1_results(phase1_results)
+
     logging.info("\n=== PIPELINE COMPLETE ===")
 
 

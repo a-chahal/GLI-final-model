@@ -283,6 +283,53 @@ def run_stage2_domain_adapt(model: BranchingPredictionHead, train_dataset: Embed
     )
 
 
+def find_optimal_threshold(labels: np.ndarray, probs: np.ndarray,
+                           metric: str = "youden") -> Tuple[float, Dict]:
+    """Find the optimal classification threshold on a validation set.
+
+    Strategies:
+        'youden': Maximize Youden's J = sensitivity + specificity - 1
+        'mcc': Maximize Matthews Correlation Coefficient
+
+    Returns:
+        (optimal_threshold, metrics_at_threshold)
+    """
+    thresholds = np.arange(0.05, 0.96, 0.01)
+    best_score = -np.inf
+    best_thresh = 0.5
+    best_metrics = {}
+
+    for t in thresholds:
+        preds = (probs >= t).astype(int)
+        tp = ((preds == 1) & (labels == 1)).sum()
+        tn = ((preds == 0) & (labels == 0)).sum()
+        fp = ((preds == 1) & (labels == 0)).sum()
+        fn = ((preds == 0) & (labels == 1)).sum()
+
+        if metric == "youden":
+            sensitivity = tp / max(tp + fn, 1)
+            specificity = tn / max(tn + fp, 1)
+            score = sensitivity + specificity - 1
+        elif metric == "mcc":
+            denom = np.sqrt(float((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)))
+            score = (tp*tn - fp*fn) / max(denom, 1e-8)
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+
+        if score > best_score:
+            best_score = score
+            best_thresh = t
+            best_metrics = {
+                "threshold": float(t),
+                "score": float(score),
+                "sensitivity": tp / max(tp + fn, 1),
+                "specificity": tn / max(tn + fp, 1),
+                "tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn),
+            }
+
+    return best_thresh, best_metrics
+
+
 def run_stage3_loocv_fold(model: BranchingPredictionHead,
                            train_dataset: EmbeddedDataset,
                            test_prot_emb: torch.Tensor,
@@ -294,6 +341,7 @@ def run_stage3_loocv_fold(model: BranchingPredictionHead,
 
     Trains on all data except one held-out positive.
     Evaluates on the held-out positive + returns MC Dropout uncertainty.
+    Also computes optimal threshold from validation set (Youden's J).
     """
     cfg = config.gli_finetune
     # For single-fold, use 90/10 val split from training data
@@ -315,6 +363,18 @@ def run_stage3_loocv_fold(model: BranchingPredictionHead,
         cosine_T0=cfg.cosine_T0, pos_weight=pw,
     )
 
+    # --- Find optimal threshold on validation set ---
+    _, val_labels, val_probs = trainer._eval_epoch(
+        val_loader, nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=device))
+    )
+    opt_thresh, thresh_info = find_optimal_threshold(val_labels, val_probs, metric="youden")
+    result["optimal_threshold"] = opt_thresh
+    result["threshold_info"] = thresh_info
+    logging.info(f"  [Fold {fold_id}] Optimal threshold: {opt_thresh:.3f} "
+                 f"(Youden's J={thresh_info['score']:.3f}, "
+                 f"sens={thresh_info['sensitivity']:.3f}, "
+                 f"spec={thresh_info['specificity']:.3f})")
+
     # MC Dropout prediction on held-out sample
     test_prot = test_prot_emb.unsqueeze(0).to(device)
     test_lig = test_lig_emb.unsqueeze(0).to(device)
@@ -325,11 +385,15 @@ def run_stage3_loocv_fold(model: BranchingPredictionHead,
     result["held_out_uncertainty"] = mc_result["std_prob"].item()
     result["held_out_label"] = test_label
     result["held_out_correct"] = int((mc_result["mean_prob"].item() >= 0.5) == test_label)
+    result["held_out_correct_calibrated"] = int(
+        (mc_result["mean_prob"].item() >= opt_thresh) == test_label
+    )
 
     logging.info(
         f"  [Fold {fold_id}] Held-out: P(bind)={result['held_out_prob']:.4f} ± "
         f"{result['held_out_uncertainty']:.4f} | "
-        f"correct={'YES' if result['held_out_correct'] else 'NO'}"
+        f"correct@0.5={'YES' if result['held_out_correct'] else 'NO'} | "
+        f"correct@{opt_thresh:.2f}={'YES' if result['held_out_correct_calibrated'] else 'NO'}"
     )
 
     return result
