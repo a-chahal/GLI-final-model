@@ -306,7 +306,8 @@ def main():
     if torch.cuda.is_available():
         for i in range(n_gpus):
             name = torch.cuda.get_device_name(i)
-            mem = torch.cuda.get_device_properties(i).total_mem / 1e9
+            props = torch.cuda.get_device_properties(i)
+            mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0)) / 1e9
             logging.info(f"  GPU {i}: {name} ({mem:.0f} GB)")
 
     # Load compounds
