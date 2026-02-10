@@ -34,7 +34,10 @@ class DataPaths:
 
 
 # Negative sources to INCLUDE (user decision: SMO inhibitors + structural only)
-NEGATIVE_SOURCES_KEEP = ["ChEMBL_SMO_inhibitor", "GANT61_inactive_analog", "random_molecule"]
+NEGATIVE_SOURCES_KEEP = [
+    "ChEMBL_SMO_inhibitor", "GANT61_inactive_analog", "random_molecule",
+    "inactive_BAS07019774_analog_missing_pyrrolidine",
+]
 
 
 @dataclass

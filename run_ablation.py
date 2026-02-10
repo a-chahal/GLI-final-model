@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""GLI-PLAPT Ablation Study — Systematic component contribution analysis.
+# -*- coding: utf-8 -*-
+"""GLI-PLAPT Ablation Study -- Systematic component contribution analysis.
 
 Removes one component at a time and measures impact on LOOCV hit rate.
 
@@ -30,7 +31,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-# --- Imports from existing pipeline ---
+# -- Imports from existing pipeline --
 from run import PrecomputedEmbeddings, precompute_all_embeddings, precompute_embeddings
 from src.config import Config, OUTPUT_DIR
 from src.data import EmbeddedDataset
@@ -46,7 +47,7 @@ import src.evaluate as _evaluate
 import src.utils as _utils
 
 
-# ─── Constants ──────────────────────────────────────────────────────────────
+# --- Constants ---------------------------------------------------------------
 
 ABLATION_DIR = os.path.join(OUTPUT_DIR, "ablation")
 SEED = 42
@@ -70,7 +71,7 @@ DESCRIPTIONS = {
 }
 
 
-# ─── Helper functions ───────────────────────────────────────────────────────
+# --- Helper functions --------------------------------------------------------
 
 def setup_condition_dirs(condition: str):
     """Create output directories for a specific ablation condition."""
@@ -108,18 +109,18 @@ def make_config(condition: str) -> Config:
     return config
 
 
-# ─── Run a single ablation condition ────────────────────────────────────────
+# --- Run a single ablation condition -----------------------------------------
 
 def run_condition(condition: str, device: torch.device) -> Dict:
     """Run the full 3-stage pipeline for one ablation condition."""
     logging.info(f"\n{'#'*70}")
-    logging.info(f"# ABLATION: {condition} -- {DESCRIPTIONS[condition]}")
+    logging.info("# ABLATION: %s -- %s" % (condition, DESCRIPTIONS[condition]))
     logging.info(f"{'#'*70}\n")
 
     config = make_config(condition)
     set_seed(SEED)
 
-    # ── Precompute embeddings (cache-backed, fast after first run) ──────
+    # -- Precompute embeddings (cache-backed, fast after first run) ------
     # For no_augmentation: use the full config so augmented SMILES are
     # generated and cached (avoids torch.stack([]) crash on 0 augments).
     # We simply won't pass the augmented dicts to LOOCV.
@@ -131,15 +132,15 @@ def run_condition(condition: str, device: torch.device) -> Dict:
     with Timer(f"Embedding precomputation [{condition}]"):
         embs = precompute_all_embeddings(embed_config, device)
 
-    # ── Build model ─────────────────────────────────────────────────────
+    # -- Build model ------------------------------------------------------
     model = BranchingPredictionHead(embs.prot_dim, embs.lig_dim, config.head)
     logging.info(f"Prediction head: {model.count_parameters():,} trainable params")
 
-    # ── Build datasets ──────────────────────────────────────────────────
+    # -- Build datasets ---------------------------------------------------
     s1_dataset = EmbeddedDataset(embs.s1_prot_embs, embs.s1_lig_embs, embs.s1_labels)
     s2_dataset = EmbeddedDataset(embs.s2_prot_embs, embs.s2_lig_embs, embs.s2_labels)
 
-    # ── Stage 1: BindingDB pretraining ──────────────────────────────────
+    # -- Stage 1: BindingDB pretraining -----------------------------------
     if condition == "no_pretrain":
         logging.info("ABLATION: Skipping Stage 1 (random initialization)")
         s1_ckpt = None
@@ -148,7 +149,7 @@ def run_condition(condition: str, device: torch.device) -> Dict:
             s1_result = run_stage1_pretrain(model, s1_dataset, config, device)
         s1_ckpt = s1_result["checkpoint_path"]
 
-    # ── Stage 2: ZF domain adaptation ───────────────────────────────────
+    # -- Stage 2: ZF domain adaptation ------------------------------------
     if condition == "no_domain_adapt":
         logging.info("ABLATION: Skipping Stage 2 (using Stage 1 checkpoint)")
         stage2_ckpt = s1_ckpt
@@ -157,7 +158,7 @@ def run_condition(condition: str, device: torch.device) -> Dict:
             s2_result = run_stage2_domain_adapt(model, s2_dataset, config, device)
         stage2_ckpt = s2_result["checkpoint_path"]
 
-    # ── Stage 3: LOOCV ──────────────────────────────────────────────────
+    # -- Stage 3: LOOCV ---------------------------------------------------
     # Override augmented dicts for no_augmentation
     aug_lig = embs.augmented_lig_embs
     aug_mfp = embs.augmented_morgan_fps
@@ -189,7 +190,7 @@ def run_condition(condition: str, device: torch.device) -> Dict:
             gli_neg_morgan_fps=embs.gli_neg_morgan_fps,
         )
 
-    # ── Save results ────────────────────────────────────────────────────
+    # -- Save results -----------------------------------------------------
     result = {
         "condition": condition,
         "description": DESCRIPTIONS[condition],
@@ -220,7 +221,7 @@ def run_condition(condition: str, device: torch.device) -> Dict:
     return result
 
 
-# ─── Collect and display results ────────────────────────────────────────────
+# --- Collect and display results ---------------------------------------------
 
 def collect_results():
     """Read all completed condition results and print summary table."""
@@ -239,7 +240,7 @@ def collect_results():
     if full is None:
         print("WARNING: Full-model baseline not yet available. Deltas shown as N/A.\n")
 
-    # ── Summary table ───────────────────────────────────────────────────
+    # -- Summary table -----------------------------------------------------
     print(f"\n{'='*80}")
     print("GLI-PLAPT ABLATION STUDY RESULTS")
     print(f"{'='*80}")
@@ -269,7 +270,7 @@ def collect_results():
         print(f"  {cond:<22} {hr:>9.1%} {delta_str:>8} "
               f"{mp:>8.3f} {fpr:>6.1%} {n_hits:>3}/{n_total}")
 
-    # ── Per-compound breakdown ──────────────────────────────────────────
+    # -- Per-compound breakdown --------------------------------------------
     if full:
         compounds = [fr["compound"] for fr in full["fold_results"]]
         avail = [c for c in CONDITIONS if c in results]
@@ -293,7 +294,7 @@ def collect_results():
                     print(f" {'N/A':>12}", end="")
             print()
 
-    # ── Save combined summary JSON ──────────────────────────────────────
+    # -- Save combined summary JSON ----------------------------------------
     summary = {}
     for cond in CONDITIONS:
         if cond in results:
@@ -313,7 +314,7 @@ def collect_results():
     print()
 
 
-# ─── Entry point ────────────────────────────────────────────────────────────
+# --- Entry point -------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="GLI-PLAPT Ablation Study")

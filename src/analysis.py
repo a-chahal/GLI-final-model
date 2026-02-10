@@ -55,34 +55,44 @@ def tanimoto_similarity_analysis(compound_names: List[str],
             "isolated": mean_sim < 0.3,  # Threshold for structural isolation
         }
 
-    # Identify clusters: compounds with mean Tanimoto > 0.4 to cluster members
-    # Simple approach: group compounds that are mutually similar
-    wen2023_names = {"Compound_39", "Compound_48", "Compound_49", "Compound_50", "Compound_52"}
+    # Identify known clusters by name patterns
+    cluster_defs = {
+        "Wen2023": {"Compound_39", "Compound_48", "Compound_49", "Compound_50", "Compound_52"},
+        "GlaB_cluster": {n for n in compound_names if any(tag in n for tag in
+                         ["GlaB", "Barardozi", "Lospinoso", "NT8", "NT9", "NT10", "NT12", "NT13", "NT14", "NT15"])},
+        "GANT61_cluster": {n for n in compound_names if any(tag in n for tag in
+                           ["GANT61", "Z27610715", "BAS06348344", "BAS09681156"])},
+    }
+
+    logging.info(f"\n  --- Structural Clustering ({n} compounds) ---")
+    cluster_stats = {}
+    for cname, members in cluster_defs.items():
+        idxs = [i for i, name in enumerate(compound_names) if name in members]
+        if len(idxs) > 1:
+            intra = [sim_matrix[i, j] for i in idxs for j in idxs if i < j]
+            cluster_stats[cname] = {
+                "size": len(idxs),
+                "intra_mean": float(np.mean(intra)),
+                "intra_std": float(np.std(intra)),
+            }
+            logging.info(f"  {cname} ({len(idxs)} cpds): intra Tc = "
+                         f"{np.mean(intra):.3f} ± {np.std(intra):.3f}")
+
+    # Legacy: Wen2023 vs rest (for backward compatibility with Phase 2A)
+    wen2023_names = cluster_defs["Wen2023"]
     wen2023_indices = [i for i, name in enumerate(compound_names) if name in wen2023_names]
     other_indices = [i for i, name in enumerate(compound_names) if name not in wen2023_names]
 
-    # Intra-cluster vs inter-cluster similarity
-    intra_sims = []
-    for i in wen2023_indices:
-        for j in wen2023_indices:
-            if i < j:
-                intra_sims.append(sim_matrix[i, j])
+    intra_sims = [sim_matrix[i, j] for i in wen2023_indices for j in wen2023_indices if i < j]
+    inter_sims = [sim_matrix[i, j] for i in wen2023_indices for j in other_indices]
+    other_sims = [sim_matrix[i, j] for i in other_indices for j in other_indices if i < j]
 
-    inter_sims = []
-    for i in wen2023_indices:
-        for j in other_indices:
-            inter_sims.append(sim_matrix[i, j])
-
-    other_sims = []
-    for i in other_indices:
-        for j in other_indices:
-            if i < j:
-                other_sims.append(sim_matrix[i, j])
-
-    logging.info(f"\n  --- Structural Clustering ---")
-    logging.info(f"  Wen2023 intra-cluster Tanimoto:   {np.mean(intra_sims):.3f} ± {np.std(intra_sims):.3f}")
-    logging.info(f"  Wen2023 ↔ Original-6 Tanimoto:    {np.mean(inter_sims):.3f} ± {np.std(inter_sims):.3f}")
-    logging.info(f"  Original-6 inter-compound Tanimoto: {np.mean(other_sims):.3f} ± {np.std(other_sims):.3f}")
+    if intra_sims:
+        logging.info(f"  Wen2023 intra-cluster Tanimoto:   {np.mean(intra_sims):.3f} ± {np.std(intra_sims):.3f}")
+    if inter_sims:
+        logging.info(f"  Wen2023 ↔ rest Tanimoto:          {np.mean(inter_sims):.3f} ± {np.std(inter_sims):.3f}")
+    if other_sims:
+        logging.info(f"  Non-Wen2023 inter Tanimoto:       {np.mean(other_sims):.3f} ± {np.std(other_sims):.3f}")
 
     logging.info(f"\n  --- Per-Compound Similarity ---")
     for name in compound_names:
@@ -95,19 +105,24 @@ def tanimoto_similarity_analysis(compound_names: List[str],
     result = {
         "sim_matrix": sim_matrix.tolist(),
         "compound_names": compound_names,
+        "n_compounds": n,
         "per_compound": per_compound,
+        "cluster_stats": cluster_stats,
         "wen2023_intra_mean": float(np.mean(intra_sims)) if intra_sims else 0.0,
         "wen2023_intra_std": float(np.std(intra_sims)) if intra_sims else 0.0,
         "inter_cluster_mean": float(np.mean(inter_sims)) if inter_sims else 0.0,
         "inter_cluster_std": float(np.std(inter_sims)) if inter_sims else 0.0,
-        "original6_inter_mean": float(np.mean(other_sims)) if other_sims else 0.0,
-        "original6_inter_std": float(np.std(other_sims)) if other_sims else 0.0,
+        "non_wen_inter_mean": float(np.mean(other_sims)) if other_sims else 0.0,
+        "non_wen_inter_std": float(np.std(other_sims)) if other_sims else 0.0,
     }
 
-    logging.info(f"\n  KEY FINDING: Wen2023 compounds share high intra-cluster Tanimoto "
-                 f"({np.mean(intra_sims):.3f}), enabling mutual LOOCV support. "
-                 f"Original 6 are structurally diverse ({np.mean(other_sims):.3f}), "
-                 f"explaining their consistent prediction failure.")
+    n_isolated = sum(1 for v in per_compound.values() if v["isolated"])
+    logging.info(f"\n  KEY FINDING: {n} compounds analyzed. "
+                 f"{n_isolated} structurally isolated (mean_Tc < 0.3). "
+                 f"Clustered compounds (Wen2023 Tc={np.mean(intra_sims):.3f}, "
+                 f"GlaB cluster Tc={cluster_stats.get('GlaB_cluster', {}).get('intra_mean', 0):.3f}) "
+                 f"will support each other in LOOCV; isolated compounds rely on "
+                 f"encoder generalization and Morgan FP features.")
 
     return result
 
