@@ -34,7 +34,7 @@ from rdkit import RDLogger
 
 RDLogger.DisableLog("rdApp.*")
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
 # Filter Constants

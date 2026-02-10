@@ -31,13 +31,13 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from rdkit import Chem
+from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 from rdkit import RDLogger
 
 RDLogger.DisableLog("rdApp.*")
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import Config, PredictionHeadConfig, CHECKPOINT_DIR
@@ -55,7 +55,7 @@ def compute_morgan_single(smiles: str) -> np.ndarray:
         return np.zeros(2048, dtype=np.float32)
     fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
     arr = np.zeros(2048, dtype=np.float32)
-    AllChem.DataStructs.ConvertToNumpyArray(fp, arr)
+    DataStructs.ConvertToNumpyArray(fp, arr)
     return arr
 
 
@@ -276,6 +276,10 @@ def main():
                         help="Use ESM-2 encoder (default)")
     parser.add_argument("--use-protbert", action="store_true",
                         help="Use ProtBERT encoder instead of ESM-2")
+    parser.add_argument("--validate", action="store_true", default=True,
+                        help="Screen known binders first as sanity check (default: on)")
+    parser.add_argument("--no-validate", dest="validate", action="store_false",
+                        help="Skip known-binder validation")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -316,32 +320,68 @@ def main():
     smiles_list = df[smiles_col].dropna().tolist()
     logging.info(f"  {len(smiles_list)} compounds to screen")
 
+    # Preserve original metadata columns for output
+    meta_cols = [c for c in df.columns if c.lower() not in {"smiles", smiles_col.lower()}]
+    meta_df = df.loc[df[smiles_col].notna(), meta_cols].reset_index(drop=True)
+
     # Step 1: Compute protein embedding (once)
     logging.info("\n--- Step 1: Protein Embedding ---")
     prot_emb = get_protein_embedding(config, device)
     logging.info(f"  Protein embedding shape: {prot_emb.shape}")
 
-    # Step 2: Encode ligands (multi-GPU)
-    logging.info("\n--- Step 2: Ligand Encoding (ChemBERTa) ---")
+    # Step 2: Load ensemble models (once — reused for validation + screening)
+    logging.info("\n--- Step 2: Load Ensemble ---")
+    models = load_fold_models(args.checkpoint_dir, config, device)
+
+    # Step 2b: Validation sanity check — screen known binders to confirm model
+    if args.validate:
+        logging.info("\n--- Validation: Screening known GLI binders ---")
+        ref_path = str(PROJECT_ROOT / "gli_inhibitors.csv")
+        ref_df = pd.read_csv(ref_path)
+        ref_smiles = ref_df["smiles"].dropna().tolist()
+        name_col = next((c for c in ref_df.columns if "name" in c.lower()), ref_df.columns[0])
+        ref_names = ref_df[name_col].tolist()
+
+        ref_lig = encode_ligands_multigpu(ref_smiles, n_gpus, config, args.batch_size)
+        ref_mfp = torch.from_numpy(compute_morgan_parallel(ref_smiles, min(args.workers, 8)))
+        ref_results = predict_ensemble(
+            models, prot_emb, ref_lig, ref_mfp,
+            mc_samples=args.mc_samples, batch_size=args.batch_size,
+        )
+        n_hits = int((ref_results["ensemble_mean"] >= 0.5).sum())
+        logging.info(f"\n  VALIDATION: {n_hits}/{len(ref_smiles)} known binders detected (>= 0.5)")
+        logging.info(f"  {'Name':<24} {'P(bind)':<9} {'Std':<7} {'Folds%':<7} {'Status'}")
+        logging.info(f"  {'-'*60}")
+        for i, name in enumerate(ref_names):
+            p = ref_results["ensemble_mean"][i]
+            s = ref_results["ensemble_std"][i]
+            fa = ref_results["n_folds_agree_above_05"][i]
+            status = "HIT" if p >= 0.5 else "MISS"
+            logging.info(f"  {name:<24} {p:<9.4f} {s:<7.4f} {fa/len(models):<7.1%} {status}")
+        if n_hits < len(ref_smiles) * 0.5:
+            logging.warning(f"  WARNING: Ensemble detects < 50% of known binders. "
+                            f"Check checkpoint integrity.")
+
+    # Step 3: Encode ligands (multi-GPU)
+    logging.info("\n--- Step 3: Ligand Encoding (ChemBERTa) ---")
     lig_embs = encode_ligands_multigpu(smiles_list, n_gpus, config, args.batch_size)
     logging.info(f"  Ligand embeddings shape: {lig_embs.shape}")
 
-    # Step 3: Morgan fingerprints (CPU parallel)
-    logging.info("\n--- Step 3: Morgan Fingerprints ---")
+    # Step 4: Morgan fingerprints (CPU parallel)
+    logging.info("\n--- Step 4: Morgan Fingerprints ---")
     morgan_fps = compute_morgan_parallel(smiles_list, args.workers)
     morgan_tensor = torch.from_numpy(morgan_fps)
     logging.info(f"  Morgan FPs shape: {morgan_tensor.shape}")
 
-    # Step 4: Load ensemble and predict
-    logging.info("\n--- Step 4: Ensemble Prediction ---")
-    models = load_fold_models(args.checkpoint_dir, config, device)
+    # Step 5: Ensemble prediction
+    logging.info("\n--- Step 5: Ensemble Prediction ---")
     results = predict_ensemble(
         models, prot_emb, lig_embs, morgan_tensor,
         mc_samples=args.mc_samples, batch_size=args.batch_size,
     )
 
-    # Step 5: Build output DataFrame
-    logging.info("\n--- Step 5: Results ---")
+    # Step 6: Build output DataFrame
+    logging.info("\n--- Step 6: Results ---")
     out_df = pd.DataFrame({
         "smiles": smiles_list,
         "ensemble_prob": results["ensemble_mean"],
@@ -350,6 +390,11 @@ def main():
         "n_folds": len(models),
         "consensus_ratio": results["n_folds_agree_above_05"] / len(models),
     })
+
+    # Merge original metadata
+    if not meta_df.empty:
+        for c in meta_cols:
+            out_df[c] = meta_df[c].values
 
     # Sort by ensemble probability (descending)
     out_df = out_df.sort_values("ensemble_prob", ascending=False)
