@@ -221,23 +221,37 @@ def collect_pubchem(output_dir: Path) -> pd.DataFrame:
         cids = list(set(cids))
         logging.info(f"    AID {aid}: {len(cids)} CIDs")
 
-        # Get SMILES in batches of 200 (PubChem URL length limit)
-        for i in range(0, len(cids), 200):
-            batch = cids[i:i+200]
+        # Get SMILES in batches of 100 via POST (GET URL too long for large CID lists)
+        batch_size = 100
+        for i in range(0, len(cids), batch_size):
+            batch = cids[i:i+batch_size]
             cid_str = ",".join(str(c) for c in batch)
-            data = api_get(
-                f"{PUBCHEM_BASE}/compound/cid/{cid_str}/property/CanonicalSMILES,MolecularWeight,XLogP/JSON",
-                source="pubchem"
-            )
-            if data:
-                for prop in data.get("PropertyTable", {}).get("Properties", []):
-                    smi = prop.get("CanonicalSMILES")
-                    if smi:
-                        all_rows.append({
-                            "smiles": smi,
-                            "source": f"PubChem_AID{aid}",
-                            "compound_id": f"CID{prop.get('CID', '')}",
-                        })
+            try:
+                resp = requests.post(
+                    f"{PUBCHEM_BASE}/compound/cid/property/CanonicalSMILES,MolecularWeight,XLogP/JSON",
+                    data={"cid": cid_str}, timeout=60,
+                    headers={"Accept": "application/json"}
+                )
+                time.sleep(API_DELAY.get("pubchem", 0.25))
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for prop in data.get("PropertyTable", {}).get("Properties", []):
+                        smi = prop.get("CanonicalSMILES") or prop.get("ConnectivitySMILES")
+                        if smi:
+                            all_rows.append({
+                                "smiles": smi,
+                                "source": f"PubChem_AID{aid}",
+                                "compound_id": f"CID{prop.get('CID', '')}",
+                            })
+                elif resp.status_code == 503:
+                    logging.warning(f"    PubChem rate limited at batch {i//batch_size}, waiting 5s...")
+                    time.sleep(5)
+                else:
+                    logging.warning(f"    PubChem batch {i//batch_size} failed: HTTP {resp.status_code}")
+            except requests.RequestException as e:
+                logging.warning(f"    PubChem batch {i//batch_size} error: {e}")
+            if i > 0 and i % 1000 == 0:
+                logging.info(f"    AID {aid}: processed {i}/{len(cids)} CIDs, {len(all_rows)} SMILES so far")
 
     df = pd.DataFrame(all_rows)
     if not df.empty:
@@ -302,8 +316,9 @@ def collect_zinc(output_dir: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def collect_dgidb(output_dir: Path) -> pd.DataFrame:
-    """Query DGIdb for approved/investigational drugs interacting with Hh pathway genes.
+    """Query DGIdb v5 GraphQL API for drugs interacting with Hh pathway genes.
 
+    DGIdb 5.0 (2024) uses GraphQL at https://dgidb.org/api/graphql.
     Cross-references ChEMBL IDs to get SMILES.
     """
     cache = output_dir / "dgidb_raw.csv"
@@ -311,26 +326,83 @@ def collect_dgidb(output_dir: Path) -> pd.DataFrame:
         logging.info(f"DGIdb: loading cached {cache}")
         return pd.read_csv(cache)
 
-    genes = ",".join(GLI_UNIPROT.keys())
-    logging.info(f"  DGIdb query: {genes}")
-    data = api_get(f"{DGIDB_BASE}/interactions.json", {"genes": genes}, "dgidb")
+    gene_names = list(GLI_UNIPROT.keys())
+    logging.info(f"  DGIdb v5 GraphQL query: {gene_names}")
 
+    # DGIdb v5 GraphQL endpoint
+    graphql_url = "https://dgidb.org/api/graphql"
+    query = """
+    query($names: [String!]!) {
+      genes(names: $names) {
+        nodes {
+          name
+          interactions {
+            nodes {
+              drug {
+                name
+                conceptId
+              }
+              interactionScore
+              interactionTypes {
+                type
+              }
+              publications {
+                nodes {
+                  pmid
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
     all_rows = []
     chembl_ids_to_lookup = []
 
-    if data:
-        for term in data.get("matchedTerms", []):
-            gene = term.get("geneName", "")
-            for interaction in term.get("interactions", []):
-                drug = interaction.get("drugName", "")
-                chembl_id = interaction.get("drugChemblId", "")
-                if chembl_id:
-                    chembl_ids_to_lookup.append((chembl_id, gene, drug))
+    try:
+        resp = requests.post(graphql_url,
+                             json={"query": query, "variables": {"names": gene_names}},
+                             timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            for gene_node in data.get("data", {}).get("genes", {}).get("nodes", []):
+                gene = gene_node.get("name", "")
+                interactions = gene_node.get("interactions", {}).get("nodes", [])
+                for interaction in interactions:
+                    drug = interaction.get("drug", {})
+                    drug_name = drug.get("name", "")
+                    concept_id = drug.get("conceptId", "")
+                    # concept_id may be chembl:CHEMBLXXXX or drugbank:DBXXXX
+                    chembl_id = ""
+                    if concept_id and "chembl" in concept_id.lower():
+                        chembl_id = concept_id.split(":")[-1] if ":" in concept_id else concept_id
+                    if chembl_id:
+                        chembl_ids_to_lookup.append((chembl_id, gene, drug_name))
+                    elif drug_name:
+                        # Try looking up by drug name in ChEMBL
+                        chembl_ids_to_lookup.append((drug_name, gene, drug_name))
+                logging.info(f"    DGIdb {gene}: {len(interactions)} interactions")
+        else:
+            logging.warning(f"  DGIdb GraphQL returned {resp.status_code}: {resp.text[:200]}")
+    except requests.RequestException as e:
+        logging.warning(f"  DGIdb GraphQL error: {e}")
 
     # Look up SMILES from ChEMBL molecule endpoint
     logging.info(f"  Looking up SMILES for {len(chembl_ids_to_lookup)} DGIdb drugs...")
-    for chembl_id, gene, drug in chembl_ids_to_lookup:
-        mol_data = api_get(f"{CHEMBL_BASE}/molecule/{chembl_id}.json", source="chembl")
+    for identifier, gene, drug in chembl_ids_to_lookup:
+        # Try direct ChEMBL ID lookup first
+        if identifier.startswith("CHEMBL"):
+            mol_data = api_get(f"{CHEMBL_BASE}/molecule/{identifier}.json", source="chembl")
+        else:
+            # Search by name
+            mol_data = api_get(f"{CHEMBL_BASE}/molecule/search.json",
+                               {"q": identifier, "limit": 1}, "chembl")
+            if mol_data and mol_data.get("molecules"):
+                mol_data = mol_data["molecules"][0]
+            else:
+                mol_data = None
+
         if mol_data:
             structs = mol_data.get("molecule_structures")
             if structs:
@@ -339,7 +411,7 @@ def collect_dgidb(output_dir: Path) -> pd.DataFrame:
                     all_rows.append({
                         "smiles": smi,
                         "source": f"DGIdb_{gene}",
-                        "compound_id": chembl_id,
+                        "compound_id": identifier if identifier.startswith("CHEMBL") else "",
                         "drug_name": drug,
                     })
 
@@ -486,6 +558,90 @@ def filter_bindingdb_zf(filepath: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Expanded ChEMBL: ALL zinc finger protein targets (409 in ChEMBL)
+# ---------------------------------------------------------------------------
+
+def collect_chembl_zf_expanded(output_dir: Path) -> pd.DataFrame:
+    """Mine ChEMBL for compounds tested against ANY zinc finger protein target.
+
+    GLI1/2 are Cys2His2 zinc finger transcription factors. Compounds that bind
+    ANY zinc finger protein have zinc-coordination pharmacophores potentially
+    repurposable for GLI. ChEMBL has ~409 zinc finger targets with thousands
+    of tested compounds — most NEVER tested against GLI.
+    """
+    cache = output_dir / "chembl_zf_expanded_raw.csv"
+    if cache.exists():
+        logging.info(f"ChEMBL ZF Expanded: loading cached {cache}")
+        return pd.read_csv(cache)
+
+    all_rows = []
+
+    # Step 1: Find all zinc finger targets in ChEMBL
+    logging.info("  Searching ChEMBL for zinc finger targets...")
+    zf_target_ids = []
+    offset = 0
+    while True:
+        data = api_get(f"{CHEMBL_BASE}/target/search.json",
+                       {"q": "zinc finger", "limit": 100, "offset": offset}, "chembl")
+        if not data:
+            break
+        targets = data.get("targets", [])
+        if not targets:
+            break
+        for t in targets:
+            tid = t.get("target_chembl_id")
+            if tid:
+                zf_target_ids.append(tid)
+        total = data.get("page_meta", {}).get("total_count", 0)
+        offset += 100
+        if offset >= total:
+            break
+
+    logging.info(f"  Found {len(zf_target_ids)} zinc finger targets in ChEMBL")
+
+    # Step 2: Also search for transcription factor inhibitors
+    for keyword in ["transcription factor inhibitor", "DNA binding protein"]:
+        data = api_get(f"{CHEMBL_BASE}/target/search.json",
+                       {"q": keyword, "limit": 100}, "chembl")
+        if data:
+            for t in data.get("targets", []):
+                tid = t.get("target_chembl_id")
+                if tid and tid not in zf_target_ids:
+                    zf_target_ids.append(tid)
+    logging.info(f"  Total targets (including TF/DNA-binding): {len(zf_target_ids)}")
+
+    # Step 3: Pull activities — limit to binding assays with measurable potency
+    # Only take first 200 targets to avoid excessive API usage
+    target_sample = zf_target_ids[:200]
+    logging.info(f"  Querying activities for {len(target_sample)} targets...")
+    for i, tid in enumerate(target_sample):
+        if i > 0 and i % 25 == 0:
+            logging.info(f"    Progress: {i}/{len(target_sample)} targets, {len(all_rows)} compounds")
+        data = api_get(f"{CHEMBL_BASE}/activity.json",
+                       {"target_chembl_id": tid, "limit": 1000,
+                        "standard_type__in": "IC50,Ki,Kd,EC50"},
+                       "chembl")
+        if data:
+            for act in data.get("activities", []):
+                smi = act.get("canonical_smiles")
+                if smi:
+                    all_rows.append({
+                        "smiles": smi,
+                        "source": "ChEMBL_ZF_expanded",
+                        "compound_id": act.get("molecule_chembl_id", ""),
+                        "activity_type": act.get("standard_type", ""),
+                        "activity_value": act.get("standard_value", ""),
+                        "activity_units": act.get("standard_units", ""),
+                    })
+
+    df = pd.DataFrame(all_rows)
+    if not df.empty:
+        df.to_csv(cache, index=False)
+    logging.info(f"ChEMBL ZF Expanded: {len(df)} records collected")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Merge & Deduplicate
 # ---------------------------------------------------------------------------
 
@@ -522,8 +678,8 @@ def main():
                         default=str(PROJECT_ROOT / "data" / "collected"))
     parser.add_argument("--sources", nargs="+",
                         default=["chembl", "pubchem", "zinc", "dgidb"],
-                        choices=["chembl", "pubchem", "zinc", "dgidb", "all"],
-                        help="API sources to query")
+                        choices=["chembl", "pubchem", "zinc", "dgidb", "chembl_zf", "all"],
+                        help="API sources to query (chembl_zf = expanded zinc finger targets)")
     parser.add_argument("--local-files", nargs="*", default=[],
                         help="Local CSV/TSV/SDF files to include (format: path:source_name)")
     parser.add_argument("--bindingdb-file", type=str, default=None,
@@ -541,7 +697,7 @@ def main():
 
     sources = args.sources
     if "all" in sources:
-        sources = ["chembl", "pubchem", "zinc", "dgidb"]
+        sources = ["chembl", "pubchem", "zinc", "dgidb", "chembl_zf"]
 
     frames = []
 
@@ -551,6 +707,7 @@ def main():
         "pubchem": collect_pubchem,
         "zinc": collect_zinc,
         "dgidb": collect_dgidb,
+        "chembl_zf": collect_chembl_zf_expanded,
     }
     for src in sources:
         if src in collectors:
