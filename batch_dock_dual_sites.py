@@ -16,8 +16,8 @@ from Bio.PDB import PDBParser
 from datetime import datetime
 
 class DualSiteBatchDocker:
-    def __init__(self, receptor_pdb='gli_structure/2gli_with_zinc.pdb', 
-                 receptor_pdbqt='gli_structure/2gli_receptor.pdbqt',
+    def __init__(self, receptor_pdb='2gli_with_zinc.pdb', 
+                 receptor_pdbqt='2gli_apo_prepared.pdbqt',
                  output_dir='docking_results'):
         
         self.receptor_pdb = receptor_pdb
@@ -52,10 +52,11 @@ class DualSiteBatchDocker:
         e119_coord = None
         e167_coord = None
         
-        # ZF4-5 Site: K340 and K350
-        print("  ZF4-5 Site (K340/K350):")
-        k340_coord = None
-        k350_coord = None
+        # ZF4-5 Site: K209/K219 (PDB) = K340/K350 (full-length)
+        # Ref: Infante et al. 2015 EMBO J — GlaB NMR CSP + K340A/K350A mutagenesis
+        print("  ZF4-5 Site (K209/K219 PDB = K340/K350 full-length):")
+        k209_coord = None
+        k219_coord = None
         
         for chain in structure[0]:
             if chain.id == 'A':
@@ -64,25 +65,24 @@ class DualSiteBatchDocker:
                         try:
                             ca_coord = res['CA'].coord
                             
-                            # Check for ZF2-3 residues
+                            # ZF2-3 residues (GANT61 site)
                             if res.resname == 'GLU' and res.id[1] == 119:
                                 e119_coord = ca_coord
                                 print(f"    Found E119 at ({ca_coord[0]:.1f}, {ca_coord[1]:.1f}, {ca_coord[2]:.1f})")
                             elif res.resname == 'GLU' and res.id[1] == 167:
                                 e167_coord = ca_coord
                                 print(f"    Found E167 at ({ca_coord[0]:.1f}, {ca_coord[1]:.1f}, {ca_coord[2]:.1f})")
-                            
-                            # Check for ZF4-5 residues
-                            elif res.resname == 'LYS' and res.id[1] == 340:
-                                k340_coord = ca_coord
-                                print(f"    Found K340 at ({ca_coord[0]:.1f}, {ca_coord[1]:.1f}, {ca_coord[2]:.1f})")
-                            elif res.resname == 'LYS' and res.id[1] == 350:
-                                k350_coord = ca_coord
-                                print(f"    Found K350 at ({ca_coord[0]:.1f}, {ca_coord[1]:.1f}, {ca_coord[2]:.1f})")
+                            # ZF4-5 residues (GlaB site)
+                            elif res.resname == 'LYS' and res.id[1] == 209:
+                                k209_coord = ca_coord
+                                print(f"    Found K209 at ({ca_coord[0]:.1f}, {ca_coord[1]:.1f}, {ca_coord[2]:.1f})")
+                            elif res.resname == 'LYS' and res.id[1] == 219:
+                                k219_coord = ca_coord
+                                print(f"    Found K219 at ({ca_coord[0]:.1f}, {ca_coord[1]:.1f}, {ca_coord[2]:.1f})")
                         except:
                             pass
         
-        # Calculate ZF2-3 center
+        # Calculate ZF2-3 center (E119/E167 midpoint)
         if e119_coord is not None and e167_coord is not None:
             center_23 = (e119_coord + e167_coord) / 2
             self.zf23_center = [float(center_23[0]), float(center_23[1]), float(center_23[2])]
@@ -90,15 +90,15 @@ class DualSiteBatchDocker:
         else:
             raise ValueError("Could not find E119/E167 for ZF2-3 site")
         
-        # Calculate ZF4-5 center
-        if k340_coord is not None and k350_coord is not None:
-            center_45 = (k340_coord + k350_coord) / 2
+        # Calculate ZF4-5 center (K209/K219 midpoint)
+        if k209_coord is not None and k219_coord is not None:
+            center_45 = (k209_coord + k219_coord) / 2
             self.zf45_center = [float(center_45[0]), float(center_45[1]), float(center_45[2])]
             print(f"  ✓ ZF4-5 center: ({self.zf45_center[0]:.1f}, {self.zf45_center[1]:.1f}, {self.zf45_center[2]:.1f})")
         else:
-            raise ValueError("Could not find K340/K350 for ZF4-5 site")
+            raise ValueError("Could not find K209/K219 (PDB) for ZF4-5 site")
         
-        self.box_size = [20, 20, 20]
+        self.box_size = [22, 22, 22]
         print(f"  Box size: {self.box_size[0]} x {self.box_size[1]} x {self.box_size[2]} Å")
     
     def prepare_ligand(self, smiles, name, temp_dir):
@@ -249,7 +249,7 @@ class DualSiteBatchDocker:
                 'zf23_score', 'zf23_status', 'zf23_file',
                 'zf45_score', 'zf45_status', 'zf45_file',
                 'best_site', 'best_score'
-            ])
+            ], extrasaction='ignore')
             writer.writeheader()
             
             for r in results:

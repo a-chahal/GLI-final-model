@@ -206,6 +206,12 @@ def extract_hits(args):
         logging.warning("No hits found! Try lowering --min-prob")
         return
     
+    # Pre-filter to top candidates before expensive clustering
+    # Butina is O(n²) — cap at 4x top_k to keep it tractable
+    cluster_pool = min(max(args.top_k * 4, 2000), len(hits)) if args.top_k else len(hits)
+    hits = hits.sort_values("ensemble_prob", ascending=False).head(cluster_pool).copy()
+    logging.info(f"Pre-filtered to top {len(hits)} for clustering")
+    
     # Load known binders
     known_df = pd.read_csv(args.known)
     known_smiles = known_df["smiles"].dropna().tolist()

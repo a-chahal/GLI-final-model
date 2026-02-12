@@ -194,6 +194,7 @@ def main():
     parser.add_argument("--enamine", type=str, help="Path to Enamine .csv or .smiles file")
     parser.add_argument("--coconut", type=str, help="Path to COCONUT .csv file")
     parser.add_argument("--output", type=str, required=True, help="Output filtered CSV path")
+    parser.add_argument("--skip-pains", action="store_true", help="Skip PAINS flagging (can add later)")
     parser.add_argument("--workers", type=int, default=min(60, cpu_count()),
                         help="Number of parallel workers")
     parser.add_argument("--batch-size", type=int, default=5000,
@@ -260,19 +261,24 @@ def main():
     filtered_df["source"] = filtered_df["smiles"].map(lambda s: original_canon.get(s, ("unknown", "unknown"))[0])
     filtered_df["compound_id"] = filtered_df["smiles"].map(lambda s: original_canon.get(s, ("unknown", "unknown"))[1])
 
-    # PAINS soft flagging (single-threaded, fast on filtered set)
-    logging.info("Applying PAINS soft flags...")
-    pains_catalog = _build_pains_catalog()
-    pains_flags = []
-    for smi in filtered_df["smiles"]:
-        mol = Chem.MolFromSmiles(smi)
-        if mol:
-            pains_flags.append(pains_catalog.HasMatch(mol))
-        else:
-            pains_flags.append(False)
-    filtered_df["pains_flag"] = pains_flags
-    n_pains = sum(pains_flags)
-    logging.info(f"  PAINS flagged: {n_pains} ({n_pains/len(filtered_df)*100:.1f}%) — soft flag only, NOT removed")
+    # PAINS soft flagging (single-threaded — slow on large sets, skippable)
+    if not args.skip_pains:
+        logging.info("Applying PAINS soft flags...")
+        pains_catalog = _build_pains_catalog()
+        pains_flags = []
+        for smi in filtered_df["smiles"]:
+            mol = Chem.MolFromSmiles(smi)
+            if mol:
+                pains_flags.append(pains_catalog.HasMatch(mol))
+            else:
+                pains_flags.append(False)
+        filtered_df["pains_flag"] = pains_flags
+        n_pains = sum(pains_flags)
+        logging.info(f"  PAINS flagged: {n_pains} ({n_pains/len(filtered_df)*100:.1f}%) — soft flag only, NOT removed")
+    else:
+        filtered_df["pains_flag"] = False
+        n_pains = 0
+        logging.info("PAINS flagging skipped (--skip-pains). Can add post-hoc.")
 
     # Final dedup on canonical SMILES
     n_before = len(filtered_df)
