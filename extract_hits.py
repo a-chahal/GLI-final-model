@@ -37,7 +37,8 @@ import numpy as np
 import pandas as pd
 
 from rdkit import Chem, DataStructs
-from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors, QED
+from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 from rdkit.ML.Cluster import Butina
 from rdkit import RDLogger
 
@@ -211,7 +212,25 @@ def extract_hits(args):
     cluster_pool = min(max(args.top_k * 4, 2000), len(hits)) if args.top_k else len(hits)
     hits = hits.sort_values("ensemble_prob", ascending=False).head(cluster_pool).copy()
     logging.info(f"Pre-filtered to top {len(hits)} for clustering")
-    
+
+    # PAINS hard filter — apply BEFORE diversity selection so clean compounds backfill
+    logging.info("Applying PAINS hard filter (pre-selection)...")
+    _pains_p = FilterCatalogParams()
+    _pains_p.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+    _pains_cat_early = FilterCatalog(_pains_p)
+    pains_mask = []
+    for smi in hits["smiles"]:
+        mol = Chem.MolFromSmiles(smi)
+        pains_mask.append(mol is not None and _pains_cat_early.HasMatch(mol))
+    n_pains_early = sum(pains_mask)
+    hits["_pains_early"] = pains_mask
+    if n_pains_early > 0:
+        hits = hits[~hits["_pains_early"]].copy()
+        logging.info(f"  PAINS removed: {n_pains_early} → {len(hits)} remain in pool")
+    else:
+        logging.info(f"  PAINS: 0 in pool (all clean)")
+    hits.drop(columns=["_pains_early"], inplace=True, errors="ignore")
+
     # Load known binders
     known_df = pd.read_csv(args.known)
     known_smiles = known_df["smiles"].dropna().tolist()
@@ -270,6 +289,61 @@ def extract_hits(args):
     hits["hbd"] = hbds
     hits["hba"] = hbas
     
+    # Med-chem filters: PAINS (hard), Brenk/NIH/ZINC (soft flags), QED
+    logging.info("Applying med-chem filters...")
+    _pains_p = FilterCatalogParams()
+    _pains_p.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+    _pains_cat = FilterCatalog(_pains_p)
+    _brenk_p = FilterCatalogParams()
+    _brenk_p.AddCatalog(FilterCatalogParams.FilterCatalogs.BRENK)
+    _brenk_cat = FilterCatalog(_brenk_p)
+    _nih_p = FilterCatalogParams()
+    _nih_p.AddCatalog(FilterCatalogParams.FilterCatalogs.NIH)
+    _nih_cat = FilterCatalog(_nih_p)
+    _zinc_p = FilterCatalogParams()
+    _zinc_p.AddCatalog(FilterCatalogParams.FilterCatalogs.ZINC)
+    _zinc_cat = FilterCatalog(_zinc_p)
+
+    pains_flags, pains_descs, brenk_flags, nih_flags, zinc_flags, qed_vals = \
+        [], [], [], [], [], []
+    for smi in hits["smiles"]:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            pains_flags.append(False); pains_descs.append("")
+            brenk_flags.append(False); nih_flags.append(False)
+            zinc_flags.append(False); qed_vals.append(np.nan)
+            continue
+        pm = _pains_cat.GetFirstMatch(mol)
+        pains_flags.append(pm is not None)
+        pains_descs.append(pm.GetDescription() if pm else "")
+        brenk_flags.append(_brenk_cat.HasMatch(mol))
+        nih_flags.append(_nih_cat.HasMatch(mol))
+        zinc_flags.append(_zinc_cat.HasMatch(mol))
+        qed_vals.append(QED.qed(mol))
+
+    hits["pains_flag"] = pains_flags
+    hits["pains_desc"] = pains_descs
+    hits["brenk_flag"] = brenk_flags
+    hits["nih_flag"] = nih_flags
+    hits["zinc_flag"] = zinc_flags
+    hits["qed"] = qed_vals
+
+    n_pains = sum(pains_flags)
+    n_before = len(hits)
+    if n_pains > 0:
+        logging.info(f"  PAINS flagged: {n_pains} — REMOVING (hard filter)")
+        hits = hits[~hits["pains_flag"]].copy()
+        logging.info(f"  After PAINS removal: {len(hits)}/{n_before}")
+    else:
+        logging.info(f"  PAINS: 0 flagged (all clean)")
+    n_brenk = hits["brenk_flag"].sum()
+    n_nih = hits["nih_flag"].sum()
+    n_zinc = hits["zinc_flag"].sum()
+    logging.info(f"  Brenk alerts: {n_brenk} (soft flag, kept)")
+    logging.info(f"  NIH alerts:   {n_nih} (soft flag, kept)")
+    logging.info(f"  ZINC alerts:  {n_zinc} (soft flag, kept)")
+    logging.info(f"  Mean QED: {hits['qed'].mean():.3f}")
+
     # Save
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     hits.to_csv(args.output, index=False)

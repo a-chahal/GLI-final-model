@@ -1,0 +1,58 @@
+; NPT Equilibration Parameters (100 ps)
+; GLI1 Zinc Finger - Ligand Complex
+; Force field: AMBER99SB-ILDN + GAFF2
+; Parrinello-Rahman barostat (Parrinello & Rahman, JAP 1981)
+
+define          = -DPOSRES      ; Position restraints on protein heavy atoms
+
+; Run parameters
+integrator      = md
+nsteps          = 50000         ; 100 ps
+dt              = 0.002
+
+; Output control
+nstxout-compressed = 5000
+nstxout         = 0
+nstvout         = 0
+nstenergy       = 500
+nstlog          = 500
+
+; Bond constraints
+continuation    = yes           ; Continuing from NVT
+constraint_algorithm = lincs
+constraints     = h-bonds
+lincs_iter      = 1
+lincs_order     = 4
+
+; Neighbor searching
+cutoff-scheme   = Verlet
+ns_type         = grid
+nstlist         = 20
+pbc             = xyz
+
+; Electrostatics
+coulombtype     = PME
+rcoulomb        = 1.2
+pme_order       = 4
+fourierspacing  = 0.16
+
+; Van der Waals
+rvdw            = 1.2
+DispCorr        = EnerPres
+
+; Temperature coupling
+tcoupl          = V-rescale
+tc-grps         = Protein_LIG   Water_and_ions
+tau_t           = 0.1           0.1
+ref_t           = 300           300
+
+; Pressure coupling
+pcoupl          = Parrinello-Rahman
+pcoupltype      = isotropic
+tau_p           = 2.0
+ref_p           = 1.0
+compressibility = 4.5e-5
+refcoord_scaling = com
+
+; Velocity generation (no - continue from NVT)
+gen_vel         = no

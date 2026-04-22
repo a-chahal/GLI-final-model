@@ -1,0 +1,55 @@
+; NVT Equilibration Parameters (100 ps)
+; GLI1 Zinc Finger - Ligand Complex
+; Force field: AMBER99SB-ILDN + GAFF2
+; V-rescale thermostat (Bussi et al., JCP 2007)
+
+define          = -DPOSRES      ; Position restraints on protein heavy atoms
+
+; Run parameters
+integrator      = md
+nsteps          = 50000         ; 100 ps (dt=0.002)
+dt              = 0.002         ; 2 fs timestep
+
+; Output control
+nstxout-compressed = 5000       ; Save coords every 10 ps
+nstxout         = 0
+nstvout         = 0
+nstenergy       = 500           ; Energy every 1 ps
+nstlog          = 500           ; Log every 1 ps
+
+; Bond constraints
+continuation    = no            ; First equilibration run
+constraint_algorithm = lincs
+constraints     = h-bonds       ; Constrain H-bonds (allows 2 fs dt)
+lincs_iter      = 1
+lincs_order     = 4
+
+; Neighbor searching
+cutoff-scheme   = Verlet
+ns_type         = grid
+nstlist         = 20
+pbc             = xyz
+
+; Electrostatics
+coulombtype     = PME
+rcoulomb        = 1.2
+pme_order       = 4
+fourierspacing  = 0.16
+
+; Van der Waals
+rvdw            = 1.2
+DispCorr        = EnerPres
+
+; Temperature coupling
+tcoupl          = V-rescale
+tc-grps         = Protein_LIG   Water_and_ions
+tau_t           = 0.1           0.1
+ref_t           = 300           300
+
+; Pressure coupling (off for NVT)
+pcoupl          = no
+
+; Velocity generation
+gen_vel         = yes
+gen_temp        = 300
+gen_seed        = -1            ; Random seed

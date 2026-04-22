@@ -1,0 +1,57 @@
+; Production MD Parameters (50 ns)
+; GLI1 Zinc Finger - Ligand Complex
+; Force field: AMBER99SB-ILDN + GAFF2
+; No position restraints — free dynamics
+; Reference: Hollingsworth & Dror, Neuron (2018)
+
+; Run parameters
+integrator      = md
+nsteps          = 25000000      ; 50 ns (dt=0.002)
+dt              = 0.002         ; 2 fs timestep
+
+; Output control
+nstxout-compressed = 5000       ; Save coords every 10 ps (.xtc)
+nstxout         = 0             ; No .trr coordinate output
+nstvout         = 0             ; No velocity output
+nstfout         = 0             ; No force output
+nstenergy       = 5000          ; Energy every 10 ps
+nstlog          = 5000          ; Log every 10 ps
+
+; Bond constraints
+continuation    = yes           ; Continuing from NPT
+constraint_algorithm = lincs
+constraints     = h-bonds
+lincs_iter      = 1
+lincs_order     = 4
+
+; Neighbor searching
+cutoff-scheme   = Verlet
+ns_type         = grid
+nstlist         = 20
+pbc             = xyz
+
+; Electrostatics
+coulombtype     = PME
+rcoulomb        = 1.2
+pme_order       = 4
+fourierspacing  = 0.16
+
+; Van der Waals
+rvdw            = 1.2
+DispCorr        = EnerPres
+
+; Temperature coupling
+tcoupl          = V-rescale
+tc-grps         = Protein_LIG   Water_and_ions
+tau_t           = 0.1           0.1
+ref_t           = 300           300
+
+; Pressure coupling
+pcoupl          = Parrinello-Rahman
+pcoupltype      = isotropic
+tau_p           = 2.0
+ref_p           = 1.0
+compressibility = 4.5e-5
+
+; Velocity generation (no — continuing)
+gen_vel         = no

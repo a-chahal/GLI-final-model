@@ -1,0 +1,25 @@
+; Energy Minimization Parameters
+; GLI1 Zinc Finger - Ligand Complex
+; Force field: AMBER99SB-ILDN + GAFF2
+; Reference: Lemkul GROMACS Tutorial; Abraham et al., SoftwareX (2015)
+
+integrator      = steep
+emtol           = 1000.0        ; Stop when Fmax < 1000 kJ/mol/nm
+emstep          = 0.01          ; Energy step size (nm)
+nsteps          = 50000         ; Max steps
+
+; Neighbor searching
+nstlist         = 10
+cutoff-scheme   = Verlet
+ns_type         = grid
+pbc             = xyz
+
+; Electrostatics
+coulombtype     = PME
+rcoulomb        = 1.2           ; nm
+pme_order       = 4
+fourierspacing  = 0.16
+
+; Van der Waals
+rvdw            = 1.2           ; nm
+DispCorr        = EnerPres      ; Long-range dispersion correction
