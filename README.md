@@ -4,7 +4,7 @@
 
 A multi-modal deep learning framework for identifying small-molecule inhibitors of the GLI1 zinc finger–DNA interface, the terminal transcriptional node of the Sonic Hedgehog pathway. GLI-NT combines cascaded transfer learning across three data regimes with docking- and molecular dynamics–based biophysical validation.
 
-*San Diego Science and Engineering Fair, Senior Division. Aaran Chahal and Sanjan Prabu.*
+*Greater San Diego Science and Engineering Fair, Senior Division. Aaran Chahal and Sanjan Prabu.*
 
 ---
 
@@ -24,7 +24,7 @@ GLI-NT has four components:
    - *Stage 1 — Pretraining:* 150,935 BindingDB pairs with random protein-ligand shuffling as negatives.
    - *Stage 2 — Domain adaptation:* 1,573 zinc-finger binding pairs with a 1 µM active/inactive threshold.
    - *Stage 3 — GLI-specific fine-tuning:* leave-one-out cross-validation (LOOCV) across 28 known GLI binders, with focal loss, asymmetric SMILES augmentation, and Youden's J threshold calibration per fold. Repeated across five random seeds.
-4. **Biophysical validation pipeline.** Candidates pass through PAINS filtering, Butina clustering for scaffold diversity (Tanimoto cutoff 0.35), dual-site AutoDock Vina docking to the 2GLI crystal structure (ZF2–3 and ZF4–5 sites, exhaustiveness 32, 10 poses, 22 Å cubic box), and 200-ns ternary molecular dynamics with GROMACS (AMBER99SB-ILDN + bsc0 for protein/DNA, GAFF2/AM1-BCC for ligand, ZAFF bonded zinc model, TIP3P water, 150 mM NaCl, Parrinello-Rahman barostat).
+4. **Biophysical validation pipeline.** Candidates pass through PAINS filtering, Butina clustering for scaffold diversity (Tanimoto cutoff 0.35), dual-site AutoDock Vina docking to the 2GLI crystal structure (ZF2–3 and ZF4–5 sites, exhaustiveness 32, 10 poses, 22 Å cubic box), and ternary molecular dynamics with GROMACS (production target 200 ns; ~110 ns analyzed per validated candidate; AMBER99SB-ILDN + bsc0 for protein/DNA, GAFF2/AM1-BCC for ligand, ZAFF bonded zinc model, TIP3P water, 150 mM NaCl, Parrinello-Rahman barostat).
 
 ---
 
@@ -61,7 +61,7 @@ GLI-NT has four components:
 │   └── mdp/                       # GROMACS .mdp files (em, nvt, npt, production)
 │
 ├── ternary_md/                    # Ternary MD pipeline (protein + DNA + ligand)
-│   └── run_ternary_pipeline.py    # GAFF2 ligand prep, ZAFF zinc, AMBER99SB-ILDN, 200 ns
+│   └── run_ternary_pipeline.py    # GAFF2 ligand prep, ZAFF zinc, AMBER99SB-ILDN (production target 200 ns; ~110 ns analyzed per validated candidate)
 │
 ├── generate_figures.py            # Publication-quality figure generation
 ├── generate_notebook_figures.py
@@ -147,7 +147,7 @@ python ternary_md/run_ternary_pipeline.py
 
 All numbers are from the five-seed LOOCV over 28 known GLI binders. Full numerical breakdown and per-compound tables are in the notebook (not included in this repository).
 
-- **Hit rate:** mean across five seeds; three compounds consistently missed across all seeds — each with Tanimoto < 0.25 to any training-set neighbor, confirming scaffold-limited generalization as the true ceiling.
+- **LOOCV hit rate:** 72.1 ± 4.7% across five seeds (n = 28 known GLI binders). Three compounds were consistently missed across all seeds, each with Tanimoto < 0.25 to any training-set neighbor — confirming scaffold-limited generalization as the true ceiling, not model capacity.
 - **Within-fold validation AUROC:** very high (~0.99). This measures separation of known binders from non-binders on the within-fold 10% split, *not* held-out-compound prediction; it reflects strong feature quality from the frozen pretrained encoders and a chemically distinct negative set.
 - **Ablation:** removing either the multi-modal fusion, the cascaded pretraining, or the focal loss each causes a measurable drop in held-out hit rate. Details in the notebook.
 - **Virtual screening:** >1 M candidate compounds scored → filtered to a diverse set of 500 via PAINS + Butina clustering; 84.6% of final candidates have max Tc < 0.4 to any known GLI binder (novel scaffolds).
@@ -180,7 +180,8 @@ If this work or codebase is useful to you, please cite:
 
 ```
 Chahal, A. and Prabu, S. (2026). GLI-NT: AI-Guided Discovery of Novel GLI1
-Inhibitors for Medulloblastoma. Greater San Diego Science and Engineering Fair.
+Inhibitors for Medulloblastoma. Greater San Diego Science and Engineering Fair,
+Senior Division.
 ```
 
 ---
